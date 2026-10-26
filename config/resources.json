@@ -1,0 +1,134 @@
+{
+  "gateway": {
+    "port": 8790,
+    "host": "127.0.0.1"
+  },
+  "master": {
+    "enabled": true
+  },
+  "gpu": {
+    "totalMiB": 8188,
+    "headroomMiB": 128
+  },
+  "resources": {
+    "image": {
+      "label": "生图 · Qwen-Image 2.1",
+      "enabled": true,
+      "exclusiveGroup": "comfy",
+      "port": 8188,
+      "backend": "comfy",
+      "vramMiB": 5500,
+      "priority": 40,
+      "keepAliveSec": 180,
+      "start": {
+        "script": "start_comfy.ps1",
+        "args": [
+          "-ReserveVram",
+          "0"
+        ]
+      },
+      "stop": {
+        "script": "stop_services.ps1",
+        "args": [
+          "-Service",
+          "comfy"
+        ]
+      },
+      "ready": {
+        "url": "http://127.0.0.1:8188/system_stats",
+        "timeoutSec": 180
+      },
+      "workflow": "qwen21-image.json",
+      "inject": {
+        "prompt": {
+          "node": "4",
+          "field": "prompt"
+        }
+      },
+      "injectByWorkflow": {
+        "anima-image.json": {
+          "prompt": {
+            "node": "4",
+            "field": "text"
+          }
+        }
+      }
+    },
+    "breeze": {
+      "label": "语音 · Breeze TTS 2",
+      "enabled": true,
+      "exclusiveGroup": "comfy",
+      "port": 8188,
+      "backend": "comfy",
+      "vramMiB": 5400,
+      "priority": 30,
+      "keepAliveSec": 180,
+      "start": {
+        "script": "start_comfy.ps1",
+        "args": [
+          "-DisableDynamicVram"
+        ]
+      },
+      "stop": {
+        "script": "stop_services.ps1",
+        "args": [
+          "-Service",
+          "comfy"
+        ]
+      },
+      "ready": {
+        "url": "http://127.0.0.1:8188/system_stats",
+        "timeoutSec": 180
+      }
+    },
+    "tts": {
+      "label": "语音 · GPT-SoVITS",
+      "enabled": true,
+      "exclusiveGroup": "gsv",
+      "port": 9880,
+      "backend": "gsv",
+      "vramMiB": 5000,
+      "priority": 10,
+      "keepAliveSec": 300,
+      "start": {
+        "script": "start_gsv.ps1",
+        "args": []
+      },
+      "stop": {
+        "script": "stop_services.ps1",
+        "args": [
+          "-Service",
+          "tts"
+        ]
+      },
+      "ready": {
+        "url": "http://127.0.0.1:9880/tts",
+        "timeoutSec": 180,
+        "method": "HEAD"
+      }
+    },
+    "memory": {
+      "label": "记忆检索 · Qwen3-Embedding-0.6B",
+      "enabled": true,
+      "exclusiveGroup": "embed",
+      "port": 9820,
+      "backend": "embed",
+      "vramMiB": 1200,
+      "priority": 20,
+      "keepAliveSec": 120,
+      "start": {
+        "cmd": "E:\\B\\venv\\Scripts\\python.exe",
+        "args": [
+          "E:\\B\\embed-server\\serve.py"
+        ]
+      },
+      "stop": {
+        "url": "http://127.0.0.1:9820/shutdown"
+      },
+      "ready": {
+        "url": "http://127.0.0.1:9820/health",
+        "timeoutSec": 60
+      }
+    }
+  }
+}

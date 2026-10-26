@@ -1,0 +1,10 @@
+# Runtime output: logs, generated audio and the commit message file are produced
+# by using the gateway, not part of it. Ignoring the whole directory also keeps
+# machine-specific paths out of the repo.
+node_modules/
+output/
+*.log
+
+# Windows noise
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lm-gateway 控制面板</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="banner" class="banner banner--offline" hidden>
+  <strong id="banner-title">网关未启动</strong>
+  <span id="banner-detail">无法连接 http://127.0.0.1:8790/api/status，请先启动网关。本页每 2 秒自动重试。</span>
+</div>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <h1>lm-gateway</h1>
+    <span class="topbar__sub">本机 GPU 模型服务网关 · 127.0.0.1:8790</span>
+  </div>
+
+  <div class="topbar__master">
+    <label class="switch" title="总控：开启＝允许拉起；关闭＝拒绝拉起并停止全部">
+      <input type="checkbox" id="master-toggle">
+      <span class="switch__track"><span class="switch__knob"></span></span>
+      <span class="switch__label">总控</span>
+    </label>
+    <span class="badge" id="master-state">未知</span>
+  </div>
+
+  <div class="topbar__conn">
+    <span class="dot" id="conn-dot"></span>
+    <span id="conn-text">连接中…</span>
+  </div>
+</header>
+
+<main>
+
+  <section class="panel" id="panel-gpu">
+    <div class="panel__head">
+      <h2>显存</h2>
+      <span class="panel__meta" id="gpu-total">—</span>
+    </div>
+    <div class="bar" id="gpu-bar">
+      <div class="bar__seg bar__seg--used" id="gpu-seg-used"></div>
+      <div class="bar__seg bar__seg--usable" id="gpu-seg-usable"></div>
+      <div class="bar__seg bar__seg--headroom" id="gpu-seg-headroom"></div>
+    </div>
+    <div class="legend">
+      <span class="legend__item"><i class="swatch swatch--used"></i>已用 <b id="gpu-used">—</b></span>
+      <span class="legend__item"><i class="swatch swatch--usable"></i>可用 <b id="gpu-usable">—</b></span>
+      <span class="legend__item"><i class="swatch swatch--headroom"></i>安全余量 <b id="gpu-headroom">—</b></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel__head">
+      <h2>资源</h2>
+      <span class="panel__meta" id="resources-summary">—</span>
+    </div>
+    <div class="cards" id="cards"></div>
+    <p class="empty" id="cards-empty" hidden>暂无资源（等待 /api/status 返回 resources）。</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel__head">
+      <h2>队列</h2>
+      <span class="panel__meta" id="queue-count">0 个等待中</span>
+    </div>
+    <div id="queue"></div>
+    <p class="empty" id="queue-empty">队列为空。</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel__head">
+      <h2>最近错误</h2>
+      <span class="panel__meta">取自各资源的 lastError</span>
+    </div>
+    <div id="errors"></div>
+    <p class="empty" id="errors-empty">暂无错误。</p>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span>数据来源：GET /api/status，每 2 秒轮询；任何操作后立即刷新。</span>
+  <span>保持时间：<code>0</code> = 用完立即停，<code>-1</code> = 常驻。</span>
+</footer>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js" defer></script>
+</body>
+</html>

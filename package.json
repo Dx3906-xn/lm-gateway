@@ -1,0 +1,21 @@
+{
+  "name": "lm-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gateway that owns the lifecycle, VRAM budget and HTTP surface of every local model service on this machine.",
+  "type": "module",
+  "main": "src/main.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "status": "node src/cli.js status",
+    "smoke": "node src/cli.js smoke",
+    "test:injection": "node src/test-injection.js",
+    "test:start": "node src/test-start.js",
+    "measure:image": "node src/measure-image.js"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}
