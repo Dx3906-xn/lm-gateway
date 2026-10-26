@@ -22,6 +22,16 @@ import * as registry from './registry.js';
 
 const DEFAULT_SCRIPTS_DIR = 'E:\\B\\scripts';
 
+/**
+ * Short-lived reachability cache, keyed by "METHOD url".
+ *
+ * Sized just above the WebUI's 2 s status poll: long enough that one poll cannot
+ * re-probe the same service twice, short enough that a service appearing or vanishing
+ * is still visible on the next poll.
+ */
+const PROBE_CACHE_MS = 2_500;
+const probeCache = new Map();
+
 /** Where the PowerShell helpers live, from config with a sane fallback. */
 function scriptsDir() {
   return getConfig().gateway?.scriptsDir ?? DEFAULT_SCRIPTS_DIR;
@@ -65,7 +75,7 @@ function resolveCommand(spec) {
 }
 
 /**
- * Run a command to completion.
+ * Run a command to completion, or hand control to a service that never completes.
  *
  * Output goes to a file rather than a pipe, and that is not a style choice. Measured
  * on this machine: `start_comfy.ps1` launches ComfyUI with `Start-Process`, the child
@@ -74,12 +84,22 @@ function resolveCommand(spec) {
  * fact up and answering `/system_stats`. A file handle does not keep the event open
  * the same way, so the launcher's exit is observed correctly.
  *
- * @param {object} spec - start or stop block.
- * @param {number} timeoutMs - hard limit.
+ * `spec.detached` covers the other shape a start command can take. Some services are
+ * started by a wrapper that backgrounds them and exits (the three `.ps1` scripts);
+ * others *are* the service, so the command's exit is its shutdown, not its completion.
+ * `serve.py` is the second kind, and waiting for it to exit meant waiting forever: the
+ * gateway killed a service that had been healthy for 117 seconds because the wait
+ * looked like a hang. When `detached` is set, the command is launched and control
+ * returns at once; whether it actually came up is decided by the readiness URL, which
+ * is the only authority that was ever correct for a long-running process.
+ *
+ * @param {object} spec - start or stop block, optionally with `detached`.
+ * @param {number} timeoutMs - hard limit for the wait, when there is one.
  * @returns {Promise<{code: number|null, stdout: string, stderr: string}>}
  */
 function runCommand(spec, timeoutMs = 120_000) {
   const { file, args } = resolveCommand(spec);
+  const detached = spec.detached === true;
 
   const logDir = join(paths.root, 'output', 'logs');
   mkdirSync(logDir, { recursive: true });
@@ -93,11 +113,12 @@ function runCommand(spec, timeoutMs = 120_000) {
     const child = spawn(file, args, { windowsHide: true, stdio: ['ignore', handle, handle] });
 
     let settled = false;
+    let timer = null;
 
     const finish = (settle, value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       try {
         closeSync(handle);
       } catch {
@@ -106,7 +127,47 @@ function runCommand(spec, timeoutMs = 120_000) {
       settle(value);
     };
 
-    const timer = setTimeout(() => {
+    const readOutput = () => {
+      try {
+        return readFileSync(logFile, 'utf8').trim();
+      } catch {
+        // Unreadable log is not a reason to lose the exit code.
+        return '';
+      }
+    };
+
+    if (detached) {
+      // A long-running service must not be waited on, but a command that dies in the
+      // first instant (bad path, missing module) should still be reported as a failure
+      // rather than turning into a readiness timeout a minute later. Give it a moment
+      // to fail fast, then hand off.
+      const settleDelayMs = spec.detachedGraceMs ?? 700;
+
+      timer = setTimeout(() => {
+        // Deliberately not unref'd: the gateway owns this service's lifetime and stops
+        // it on the way down. Detaching the handle would let a crash strand it holding
+        // GBs of VRAM with nothing left to reclaim it.
+        finish(resolve, {
+          code: 0,
+          stdout: `${file} launched detached; readiness decides success`,
+          stderr: '',
+        });
+      }, settleDelayMs);
+
+      child.on('error', (error) => finish(reject, error));
+
+      child.on('close', (code) => {
+        // Exited inside the grace window: this is a start failure, not a service.
+        finish(reject, new Error(
+          `detached start command exited immediately with code ${code}: ` +
+          `${readOutput().slice(0, 300) || 'no output'}`,
+        ));
+      });
+
+      return;
+    }
+
+    timer = setTimeout(() => {
       try {
         child.kill();
       } catch {
@@ -118,15 +179,9 @@ function runCommand(spec, timeoutMs = 120_000) {
     child.on('error', (error) => finish(reject, error));
 
     child.on('close', (code) => {
-      let output = '';
-      try {
-        output = readFileSync(logFile, 'utf8');
-      } catch {
-        // Unreadable log is not a reason to lose the exit code.
-      }
       // Both streams land in one file, so the merged text is returned as stdout and
       // stderr stays empty; callers already prefer whichever is non-empty.
-      finish(resolve, { code, stdout: output.trim(), stderr: '' });
+      finish(resolve, { code, stdout: readOutput(), stderr: '' });
     });
   });
 }
@@ -138,22 +193,47 @@ function runCommand(spec, timeoutMs = 120_000) {
  * that is up must not read as "still starting", or every start of that service would
  * burn its whole timeout.
  *
+ * Results are cached briefly for the status path and bypassed for readiness polling.
+ * Two reasons, both learned the hard way:
+ *
+ *   - The WebUI polls `/api/status` every 2 s, and that walks every resource. Without
+ *     a cache each poll opened a fresh connection to each service, and a probe that
+ *     timed out was aborted mid-response - which the service sees as a client
+ *     disconnect (`ConnectionResetError` on the Python side) and logs as an error, even
+ *     though nothing was wrong with it.
+ *   - `image` and `breeze` share port 8188, so one status pass was probing the same
+ *     URL twice.
+ *
+ * `waitReady` passes `fresh: true`, because it is watching for a change and a cached
+ * answer would defeat the point.
+ *
  * @param {string} url - probe target.
  * @param {string} method - GET or HEAD.
  * @param {number} timeoutMs - per-attempt limit.
+ * @param {object} [options] - `fresh` skips the cache.
  * @returns {Promise<boolean>} whether an HTTP response arrived.
  */
-export async function isReachable(url, method = 'GET', timeoutMs = 5_000) {
+export async function isReachable(url, method = 'GET', timeoutMs = 5_000, { fresh = false } = {}) {
+  const key = `${method} ${url}`;
+  const now = Date.now();
+  const cached = probeCache.get(key);
+
+  if (!fresh && cached && now - cached.at < PROBE_CACHE_MS) return cached.ok;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let ok = false;
   try {
     await fetch(url, { method, signal: controller.signal, redirect: 'manual' });
-    return true;
+    ok = true;
   } catch {
-    return false;
+    ok = false;
   } finally {
     clearTimeout(timer);
   }
+
+  probeCache.set(key, { at: now, ok });
+  return ok;
 }
 
 /**
@@ -168,7 +248,8 @@ async function waitReady(resource, timeoutSec) {
   const method = resource.ready?.method ?? 'GET';
 
   while (Date.now() < deadline) {
-    if (await isReachable(resource.ready.url, method)) return true;
+    // fresh: this loop exists to observe a change, so a cached answer would defeat it.
+    if (await isReachable(resource.ready.url, method, 5_000, { fresh: true })) return true;
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   return false;
@@ -177,6 +258,10 @@ async function waitReady(resource, timeoutSec) {
 /**
  * Wait for a URL to stop answering.
  *
+ * `fresh` matters here more than anywhere: a cached "yes it answers" would keep this
+ * loop from ever observing the shutdown it is waiting for, and every stop would then
+ * sit until its timeout and report failure.
+ *
  * @param {string} url - probe target.
  * @param {number} timeoutSec - how long to wait.
  * @returns {Promise<boolean>} true when it stopped answering.
@@ -184,7 +269,7 @@ async function waitReady(resource, timeoutSec) {
 async function waitGone(url, timeoutSec) {
   const deadline = Date.now() + timeoutSec * 1000;
   while (Date.now() < deadline) {
-    if (!(await isReachable(url, 'GET', 2_000))) return true;
+    if (!(await isReachable(url, 'GET', 2_000, { fresh: true }))) return true;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return false;
@@ -205,7 +290,7 @@ export async function start(id) {
 
   // Already up - but distinguish "we started it" from "a human did", so a later
   // idle release does not shut down something the operator wants to keep.
-  if (await isReachable(resource.ready.url, resource.ready?.method ?? 'GET')) {
+  if (await isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
     registry.markExternal(id);
     state.state = 'ready';
     log.info(`${id} already running; leaving ownership alone`);
@@ -231,7 +316,7 @@ export async function start(id) {
     // before reporting a failure. Combined with the file-based output above, this is
     // the second half of the same defence: the wait is not authoritative about whether
     // the process came up, only the readiness URL is.
-    if (await isReachable(resource.ready.url, resource.ready?.method ?? 'GET')) {
+    if (await isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
       log.warn(`${id} launcher timed out but the service is answering; treating it as started`);
       state.state = 'ready';
       state.startedByUs = true;
@@ -293,7 +378,7 @@ export async function stop(id, { force = false } = {}) {
 
   state.state = 'stopping';
 
-  if (!(await isReachable(resource.ready.url, 'GET', 3_000))) {
+  if (!(await isReachable(resource.ready.url, 'GET', 3_000, { fresh: true }))) {
     state.state = 'idle';
     state.startedByUs = false;
     state.startedAt = null;

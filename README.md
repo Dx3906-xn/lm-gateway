@@ -68,9 +68,11 @@ node src\cli.js status
 ## 自测
 
 ```powershell
-node src\cli.js smoke          # 开关语义：关闭时必须拒绝且不拉起进程（约 30s）
-node src\test-injection.js     # prompt 注入点（纯逻辑，秒级）
-node src\test-start.js image   # 冷启动真实拉起（约 1 分钟）
+node src\cli.js smoke            # 开关语义：关闭时必须拒绝且不拉起进程（约 30s）
+node src\test-injection.js       # prompt 注入点（纯逻辑，秒级）
+node src\test-start.js image     # 冷启动真实拉起，长命令型（约 1 分钟）
+node src\test-start.js memory    # 冷启动真实拉起，常驻型（约 30 秒）
+node src\test-memory.js          # 记忆检索端到端 + encodeVersion（约 30 秒）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
 

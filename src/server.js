@@ -129,15 +129,38 @@ async function handleStatus() {
 
   // Reflect reality for services that are up but were not launched by us, so the
   // status view never claims "not running" about something holding VRAM.
-  for (const id of Object.keys(config.resources)) {
+  //
+  // Probed in parallel. Serially, one status call cost the sum of every probe, and a
+  // probe that timed out was aborted mid-response - which the service sees as a client
+  // disconnect and logs as an error even though it is healthy. The probe result is
+  // cached briefly inside isReachable, so the WebUI's 2 s poll is not a hammer.
+  await Promise.all(Object.keys(config.resources).map(async (id) => {
     const state = registry.entry(id);
-    if (state.state !== 'idle') continue;
+    if (state.state !== 'idle') return;
     const resource = config.resources[id];
-    if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 1_500)) {
+    if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 3_000)) {
       registry.markExternal(id);
       state.state = 'ready';
     }
-  }
+  }));
+
+  const resources = registry.describeAll(config);
+
+  // Attach live backend info to running embedding services. The caller's vector cache
+  // is keyed by encoder version, and without this field the only thing it can key on is
+  // a constant - so replacing the embedding model would keep answering from vectors
+  // built by the old one, silently.
+  await Promise.all(resources.map(async (entry) => {
+    const resource = config.resources[entry.id];
+    if (resource?.backend !== 'embed') return;
+    if (entry.state !== 'ready' && entry.state !== 'busy') return;
+
+    const info = await embed.health(`http://127.0.0.1:${resource.port}`);
+    entry.info = info;
+    // Promoted to the top level so a caller does not have to know which backend
+    // produced it.
+    entry.encodeVersion = info?.encodeVersion ?? null;
+  }));
 
   return {
     master: config.master?.enabled ?? true,
@@ -147,7 +170,7 @@ async function handleStatus() {
       headroomMiB: config.gpu?.headroomMiB ?? 0,
       usableMiB: gpu.ok ? usableMiB(gpu, config.gpu?.headroomMiB ?? 0) : 0,
     },
-    resources: registry.describeAll(config),
+    resources,
     groups: registry.groupSnapshot(),
     queue: scheduler.queueSnapshot(),
   };
@@ -299,9 +322,13 @@ async function handleSearch(body) {
       throw new ValidationError(`resource "${id}" is not an embedding backend`);
     }
     const base = baseUrl(resource);
+    // A deadline on every call out. Without one, a service that dies mid-request
+    // leaves this handler waiting on a socket that will never answer - the request
+    // neither returns nor fails, and the caller has nothing to retry against.
+    const timeoutSec = body.timeoutSec ?? 120;
 
     if (Array.isArray(body.texts)) {
-      const result = await embed.embed(base, body.texts);
+      const result = await embed.embed(base, body.texts, timeoutSec);
       return { ok: true, ...result, elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)) };
     }
 
@@ -311,7 +338,7 @@ async function handleSearch(body) {
         // "nothing matched" rather than "the request was incomplete".
         throw new ValidationError('search requires "candidates" when "query" is given');
       }
-      const result = await embed.similarity(base, body.query, body.candidates);
+      const result = await embed.similarity(base, body.query, body.candidates, timeoutSec);
       const ranked = result.scores
         .map((score, index) => ({ index, score, text: body.candidates[index] }))
         .sort((a, b) => b.score - a.score)

@@ -200,7 +200,9 @@ async function ensureRunning(id) {
   if (state.state === 'ready' || state.state === 'busy') return;
 
   // Already up but unrecorded (started by hand, or before this process existed).
-  if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET')) {
+  // fresh: whether to launch is a decision, so a cached probe must not answer it - a
+  // stale "no" would start a second copy of something already running.
+  if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
     registry.markExternal(id);
     state.state = 'ready';
     return;

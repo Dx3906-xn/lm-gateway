@@ -123,6 +123,13 @@ Content-Type: application/json; charset=utf-8
 - `keepAliveRemainingSec`：保持窗口剩余秒数；没有定时器时为 `null`。
 - `yielded`：为腾显存被网关停掉过，**不会自动重启**，下次请求才拉起。
 - `inflight`：正在执行的请求数。
+- `groupActive` / `blockedByGroup`：同一 `exclusiveGroup` 里当前由谁在服务。
+  两者都为 `null` 时表示端口活着但**不是网关起的**，因此无法判断加载的是哪套配置
+  （`image` 与 `breeze` 共用 8188 但启动参数相反）。
+- `encodeVersion` / `info`：**仅 `backend=embed` 且该资源在运行时出现**。`info` 是
+  `/health` 的原始返回，`info.encodeVersion` 同时提升为顶层 `encodeVersion`。
+  调用方的向量缓存**应当以它为键**：没有这个字段时只能用一个常量，于是换掉 embedding
+  模型之后仍会用旧模型算出的向量回答，而且不会报任何错。
 - `gpu.ok=false` 时三个数字为 0 并带 `error`（`nvidia-smi` 不可用），此时网关按配置里的
   `vramMiB` 估算准入，而不是拒绝工作。
 - `usableMiB = freeMiB − headroomMiB`（下限 0）。

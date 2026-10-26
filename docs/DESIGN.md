@@ -149,8 +149,8 @@ E:\B\lm-gateway\
       "vramMiB": 1200,
       "priority": 20,
       "keepAliveSec": 120,
-      "start": { "cmd": "E:\\B\\venv\\Scripts\\python.exe", "args": ["E:\\B\\embed-server\\serve.py"] },
-      "stop":  { "url": "http://127.0.0.1:9820/shutdown" },
+      "start": { "cmd": "E:\\B\\venv\\Scripts\\python.exe", "args": ["E:\\B\\embed-server\\serve.py"], "detached": true },
+      "stop":  { "url": "http://127.0.0.1:9820/shutdown", "waitSec": 30 },
       "ready": { "url": "http://127.0.0.1:9820/health", "timeoutSec": 60 }
     }
     // 未来 video 资源照此格式追加
@@ -169,9 +169,9 @@ E:\B\lm-gateway\
 | `vramMiB` | ✅ | **实测增量**，供账本判断（见下方实测表） |
 | `priority` | ✅ | 数字越小越优先；被抢占时大数字先让位 |
 | `keepAliveSec` | ✅ | `>0` 保持秒数；`0` 用完立刻停；`-1` 常驻 |
-| `start` | ✅ | `script`+`args`（走 PowerShell）或 `cmd`+`args`（直接执行） |
-| `stop` | ✅ | 同上，或 `url`（POST 优雅关闭） |
-| `ready` | ✅ | 轮询直到就绪；`method` 默认 GET |
+| `start` | ✅ | `script`+`args`（走 PowerShell）或 `cmd`+`args`（直接执行）。**`detached: true` 用于本身就是服务的常驻进程**（见 §11） |
+| `stop` | ✅ | 同上，或 `url`（POST 优雅关闭）。`waitSec` 是等待端口释放的上限（默认 30） |
+| `ready` | ✅ | 轮询直到就绪；`method` 默认 GET。**判定是"有 HTTP 响应"，不是"200"** |
 | `workflow` | comfy 生图 | 默认工作流文件名 |
 | `inject` | comfy 生图必填 | 默认注入点：`{"prompt": {"node": "4", "field": "prompt"}}` |
 | `injectByWorkflow` | 可选 | 按工作流覆盖注入点，**换工作流必查**（见下） |
@@ -286,7 +286,11 @@ Base：`http://127.0.0.1:8790`
       "lastUsedAt": null,        // epoch **毫秒**
       "lastError": null,
       "yielded": false,
-      "inflight": 0
+      "inflight": 0,
+      // 仅 backend=embed 且运行时出现。向量缓存以编码器版本为键，缺了它调用方
+      // 只能用常量，于是换 embedding 模型后仍会用旧向量回答——错得很安静。
+      "encodeVersion": "2-maskpool",
+      "info": { "ok": true, "model": "Qwen/Qwen3-Embedding-0.6B", "dim": 1024, "encodeVersion": "2-maskpool" }
     }
   ],
   "groups": { "gsv": "tts" },    // 各互斥组的归属
@@ -412,15 +416,23 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 6 | 新增资源只改 json | 配置校验器 `validateConfig` 0 problems |
 | 7 | 冷启动能拉起来 | `test-start`：冷启动 **16.6s**，无超时 |
 | 8 | 注入点不静默失效 | `test-injection` 13/13：anima 用 `text`、qwen21 用 `prompt`，写错字段被拒 |
+| 9 | 常驻服务（memory）能拉起并能停下 | `test-start memory` 10/10：冷启动 **10.9s**（修复前 120s 超时并杀掉健康进程） |
+| 10 | 记忆检索端到端可用 | `test-memory` 16/16：`encodeVersion="2-maskpool"`、中文向量可区分、排序正确、stop 释放端口 |
 
 复跑：
 
 ```powershell
-node src\cli.js smoke          # 开关语义（约 30s，会真的停一次服务）
-node src\test-injection.js     # 注入点（纯逻辑，秒级）
-node src\test-start.js image   # 冷启动（约 1 分钟）
+node src\cli.js smoke            # 开关语义（约 30s，会真的停一次服务）
+node src\test-injection.js       # 注入点（纯逻辑，秒级）
+node src\test-start.js image     # 冷启动，长命令型（约 1 分钟）
+node src\test-start.js memory    # 冷启动，常驻型（约 30 秒）
+node src\test-memory.js          # 记忆检索端到端（约 30 秒）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
+
+**测试自身也要能被信任**：断言辅助只在 `src/test-util.js` 里实现一份。此前三个测试
+各自复制了 `check()`，且都写成声明三参数、调用传四参数，导致字符串落进 `passed` 位、
+**每个断言都恒为真**。三份"全过"的结果因此毫无意义。现在没有第二份签名可以漂移。
 
 ---
 
@@ -434,9 +446,19 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
 - **`cuda_graphs` 模式会崩 ComfyUI**，Breeze 一律用 `eager`（代码内固定）
 - **启动命令的输出必须写文件不能走管道**：`Start-Process` 的子进程会继承管道，
   Node 等不到 `close`，实测报 120s 超时（而服务其实已就绪）
+- **常驻服务必须标 `detached: true`**：`serve.py` 这类命令**本身就是服务**，永不退出。
+  按"等命令结束"的语义处理，网关会等满超时再 `kill` 掉一个已经健康运行 117 秒的进程。
+  标了 `detached` 后启动即交接，成功与否由 `ready` 决定；另给 700ms 宽限，
+  让"路径错/模块缺失"这类立即崩溃仍能被报成启动失败而不是就绪超时
+- **探测失败不等于服务不健康**：`/api/status` 的探测会在超时后中断连接，服务端把这
+  看成调用方掉线并记一条错误日志。探测结果现有 2.5 秒缓存，且并行执行；
+  决策路径（是否要拉起）与就绪轮询都传 `fresh: true` 绕过缓存
 - `nvidia-smi` 的 `used + free ≠ total`；**用 `free` 判断可分配量**
-- `stop_services.ps1 -Service` 合法值：`all | comfy | tts`
+- `stop_services.ps1 -Service` 合法值：`all | comfy | tts`（不含 embed；memory 用 `/shutdown`）
 - 同端口的互斥资源**外部启动时无法区分是哪套配置**，`groupActive` 为 `null`
+- **测试脚本不要用 `process.exit()`**：Windows 上会在 HTTP 套接字关闭途中触发 libuv
+  断言 `!(handle->flags & UV_HANDLE_CLOSING)`，并把退出码改成 1，让通过的测试看起来是失败。
+  用 `test-util.js` 的 `exitWith()`
 
 ---
 
@@ -461,3 +483,15 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
 | `headroomMiB` | 300 | 128 |
 | 启动命令输出 | 管道 | 文件（管道会挂住） |
 | 源文件组织 | `src/routes/*` | 合并进 `server.js`（路由表很小） |
+
+### 第二轮：来自调用方（记忆检索）的缺陷报告
+
+| 缺陷 | 原因 | 修复 |
+|---|---|---|
+| **memory 拉起后 120s 超时，健康进程被杀** | `runCommand` 等 `close`，而 `serve.py` 永不退出；超时后 `kill` 掉刚起来的服务 | 新增 `start.detached`；启动即交接，成功由 `ready` 判定，另留 700ms 抓立即崩溃 |
+| 健康探测引发服务端 `ConnectionResetError` | `/api/status` 每次轮询对每个资源探测，超时中断连接被服务记为错误 | 探测加 2.5s 缓存并并行；决策路径与就绪轮询用 `fresh: true` |
+| `/api/status` 无 `encodeVersion` | 调用方的向量缓存以编码器版本为键，没有它只能用常量，换模型后静默复用旧向量 | status 对运行中的 embed 资源附 `info` 与顶层 `encodeVersion` |
+| `/api/search` 无服务端超时 | embed 调用没有 deadline，服务中途死掉则请求既不返回也不失败 | `embed`/`similarity` 加 `AbortController` 超时，默认 120s，可用 `timeoutSec` 覆盖 |
+| memory 无 `stop.waitSec` | 只配了 `url`，未声明等待上限 | 配置显式 `waitSec: 30` |
+| 测试假通过（三次） | 三个测试各自复制 `check()`，都声明三参数、调用传四参数，字符串落进 `passed` 位 → 断言恒为真 | 抽出唯一一份 `src/test-util.js`；签名不再有第二份可漂移 |
+| 测试通过却退出码 1 | `process.exit()` 在套接字关闭途中触发 libuv 断言，断言把退出码改成 1 | 改用 `exitWith()`（设 `exitCode` + 排空事件循环） |

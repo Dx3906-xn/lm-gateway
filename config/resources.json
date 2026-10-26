@@ -120,10 +120,12 @@
         "cmd": "E:\\B\\venv\\Scripts\\python.exe",
         "args": [
           "E:\\B\\embed-server\\serve.py"
-        ]
+        ],
+        "detached": true
       },
       "stop": {
-        "url": "http://127.0.0.1:9820/shutdown"
+        "url": "http://127.0.0.1:9820/shutdown",
+        "waitSec": 30
       },
       "ready": {
         "url": "http://127.0.0.1:9820/health",

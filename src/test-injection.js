@@ -13,21 +13,9 @@
 
 import { getConfig } from './config.js';
 import { buildWorkflow, resolveInjection, nodeFields } from './backends/comfy.js';
+import { createReporter, exitWith } from './test-util.js';
 
-const results = [];
-
-/**
- * Record and print one assertion.
- *
- * `results` is closed over rather than passed in, so the signature cannot drift out of
- * step with the call sites. An earlier version declared `(name, passed, detail)` while
- * every call passed four arguments, which shifted a string into the `passed` slot and
- * made all thirteen assertions report PASS regardless of what they tested.
- */
-function check(name, passed, detail) {
-  results.push({ name, passed, detail });
-  console.log(`  ${passed ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
-}
+const { check, finish } = createReporter();
 
 function throws(fn) {
   try {
@@ -114,10 +102,4 @@ check( 'a second load does not carry the previous injection',
   fresh['4'].inputs.prompt !== 'X',
   `stored prompt is ${JSON.stringify(fresh['4'].inputs.prompt).slice(0, 40)}`);
 
-const failed = results.filter((result) => !result.passed);
-console.log();
-console.log(`${results.length - failed.length}/${results.length} passed`);
-if (failed.length > 0) {
-  for (const result of failed) console.log(`  - ${result.name}: ${result.detail}`);
-  process.exit(1);
-}
+exitWith(finish());

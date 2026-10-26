@@ -16,48 +16,14 @@
  * a sane time and the port must be answering.
  */
 
-import { createConnection } from 'node:net';
+import { createReporter, callGateway, portOpen, exitWith } from './test-util.js';
 
 const BASE = process.env.LM_GATEWAY_URL ?? 'http://127.0.0.1:8790';
 const resourceId = process.argv[2] ?? 'image';
 
-const results = [];
-/**
- * Record and print one assertion.
- *
- * `results` is closed over rather than passed in. That is deliberate: an earlier
- * version of this file declared a three-parameter function while every call site
- * passed four arguments, which shifted a string into the `passed` slot and made every
- * assertion report PASS. Closing over the array removes the mismatch entirely - a test
- * that cannot fail is worse than no test.
- */
-function check(name, passed, detail) {
-  results.push({ name, passed, detail });
-  console.log(`  ${passed ? 'PASS' : 'FAIL'}  ${name}${detail ? `  (${detail})` : ''}`);
-}
+const { check, section, finish } = createReporter();
 
-function portOpen(port, timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const socket = createConnection({ host: '127.0.0.1', port });
-    const done = (value) => {
-      socket.destroy();
-      resolve(value);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.on('connect', () => done(true));
-    socket.on('timeout', () => done(false));
-    socket.on('error', () => done(false));
-  });
-}
-
-async function call(method, path, body) {
-  const response = await fetch(`${BASE}${path}`, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json; charset=utf-8' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  return { status: response.status, body: await response.json().catch(() => null) };
-}
+const call = (method, path, body, timeoutSec) => callGateway(BASE, method, path, body, timeoutSec);
 
 const status = await call('GET', '/api/status');
 const resource = status.body.resources.find((entry) => entry.id === resourceId);
@@ -79,7 +45,10 @@ check( 'port released after stop', closed, `port ${resource.port}`);
 // --- 2. start it, and time the whole thing ---------------------------------
 console.log('2. start (cold: the service has to load its model)');
 const started = Date.now();
-const start = await call('POST', `/api/resources/${resourceId}/start`);
+// The start call waits for readiness inside the gateway (up to ready.timeoutSec, 180 s
+// for ComfyUI), so the client deadline has to be longer than that or it would abandon a
+// launch that is still legitimately coming up.
+const start = await call('POST', `/api/resources/${resourceId}/start`, undefined, 240);
 const elapsed = ((Date.now() - started) / 1000).toFixed(1);
 
 check( 'start reports ok', start.body?.ok === true,
@@ -114,10 +83,4 @@ check( 'final stop reports ok', finalStop.body?.ok === true,
 check( 'port released at the end', !(await portOpen(resource.port, 3000)),
   `port ${resource.port}`);
 
-const failed = results.filter((result) => !result.passed);
-console.log();
-console.log(`${results.length - failed.length}/${results.length} passed`);
-if (failed.length > 0) {
-  for (const result of failed) console.log(`  - ${result.name}: ${result.detail}`);
-  process.exit(1);
-}
+exitWith(finish());

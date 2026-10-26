@@ -209,12 +209,30 @@ async function commandSmoke() {
 
 const command = process.argv[2] ?? 'status';
 
+/**
+ * Exit with a status, without forcing the process down mid-close.
+ *
+ * `process.exit()` here tripped a libuv assertion on Windows
+ * (`Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`, async.c) because it stops
+ * the loop while an HTTP socket is still closing - and the assertion itself sets the
+ * exit code to 1, so a passing test reported failure to whatever ran it. Setting
+ * `exitCode` and letting the loop drain produces the same status cleanly.
+ */
+function exit(code) {
+  process.exitCode = code;
+  // undici keeps connections alive for a few seconds, which would otherwise hold the
+  // process open after the work is done. This is the backstop; if the loop drains
+  // first, the unref'd timer never fires.
+  const backstop = setTimeout(() => process.exit(code), 3_000);
+  backstop.unref();
+}
+
 try {
   const code = command === 'status' ? await commandStatus()
     : command === 'smoke' ? await commandSmoke()
       : (console.error(`unknown command "${command}"; expected status or smoke`), 2);
-  process.exit(code);
+  exit(code);
 } catch (error) {
   console.error(String(error?.stack ?? error));
-  process.exit(1);
+  exit(1);
 }

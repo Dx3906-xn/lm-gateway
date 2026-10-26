@@ -14,6 +14,7 @@
     "smoke": "node src/cli.js smoke",
     "test:injection": "node src/test-injection.js",
     "test:start": "node src/test-start.js",
+    "test:memory": "node src/test-memory.js",
     "measure:image": "node src/measure-image.js"
   },
   "dependencies": {},

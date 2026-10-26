@@ -24,30 +24,61 @@ export async function health(base) {
 }
 
 /**
+ * POST JSON to the embedding service, with a deadline.
+ *
+ * The timeout is not decoration. A stuck service - or one whose process was killed
+ * while a request was in flight, which this gateway has done to it once - leaves the
+ * connection open and the caller waiting forever. Without a deadline that becomes a
+ * request that never returns and never errors, which is the worst state a caller can
+ * be left in, because there is nothing to retry against.
+ *
+ * @param {string} url - full endpoint.
+ * @param {object} payload - JSON body.
+ * @param {number} timeoutSec - deadline.
+ * @returns {Promise<object>} parsed response.
+ */
+async function postJson(url, payload, timeoutSec) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      // Body is sent as a UTF-8 string with the charset declared. On this machine a
+      // PowerShell caller must go further and pass raw bytes; from Node this is
+      // already correct, but the charset header is what makes it explicit.
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`embed server returned ${response.status}: ${detail.slice(0, 300)}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`embed server did not answer within ${timeoutSec}s: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Embed a list of texts.
  *
  * @param {string} base - service base URL.
  * @param {string[]} texts - inputs.
+ * @param {number} timeoutSec - deadline.
  * @returns {Promise<{vectors: number[][], dim: number}>}
  */
-export async function embed(base, texts) {
+export async function embed(base, texts, timeoutSec = 120) {
   if (!Array.isArray(texts) || texts.length === 0) throw new Error('embed requires a non-empty "texts" array');
-
-  const response = await fetch(`${base}/embed`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    // Body is sent as a UTF-8 string with the charset declared. On this machine a
-    // PowerShell caller must go further and pass raw bytes; from Node this is
-    // already correct, but the charset header is what makes it explicit.
-    body: JSON.stringify({ texts }),
-  });
-
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new Error(`embed server returned ${response.status}: ${detail.slice(0, 300)}`);
-  }
-
-  return await response.json();
+  return postJson(`${base}/embed`, { texts }, timeoutSec);
 }
 
 /**
@@ -56,21 +87,11 @@ export async function embed(base, texts) {
  * @param {string} base - service base URL.
  * @param {string} query - the query.
  * @param {string[]} texts - candidates.
+ * @param {number} timeoutSec - deadline.
  * @returns {Promise<{scores: number[]}>}
  */
-export async function similarity(base, query, texts) {
-  const response = await fetch(`${base}/similarity`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    body: JSON.stringify({ query, texts }),
-  });
-
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new Error(`embed server returned ${response.status}: ${detail.slice(0, 300)}`);
-  }
-
-  return await response.json();
+export async function similarity(base, query, texts, timeoutSec = 120) {
+  return postJson(`${base}/similarity`, { query, texts }, timeoutSec);
 }
 
 /**
