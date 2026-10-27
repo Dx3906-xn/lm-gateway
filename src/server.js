@@ -226,6 +226,81 @@ async function handleStop(id) {
 // Business endpoints
 // --------------------------------------------------------------------------- //
 
+/**
+ * Where a backend writes the files it produces.
+ *
+ * Needed because the two answer shapes disagreed: `/api/image` returned bare names
+ * that live under ComfyUI's output directory, while `/api/speak` returned an absolute
+ * path. A caller had to know which endpoint it had called before it could open the
+ * result, and the plugin consuming this gateway papered over that with a comment
+ * saying it was treating "two shapes as one problem". The directory is now declared
+ * per resource so both can answer the same way.
+ *
+ * @param {object} config - loaded config.
+ * @param {object} resource - the resource that produced the file.
+ * @returns {string} absolute directory.
+ */
+function outputDirFor(config, resource) {
+  return resource.outputDir ?? config.gateway?.outputDir ?? join(paths.root, 'output');
+}
+
+/**
+ * Build the uniform artifact list every producing endpoint returns.
+ *
+ * @param {string} dir - directory the files live in.
+ * @param {string[]} names - bare filenames.
+ * @param {string} type - "image" or "audio".
+ * @returns {{type: string, filename: string, path: string}[]} artifacts.
+ */
+function artifactsFor(dir, names, type) {
+  return (names ?? []).map((filename) => ({
+    type,
+    filename,
+    path: join(dir, filename),
+  }));
+}
+
+/**
+ * A cheap liveness probe.
+ *
+ * Deliberately does not touch the backend services. Whether a model is resident is a
+ * different question, answered by `/api/status`, and having every resource idle is the
+ * normal state here - nothing is kept running by default. What a supervisor needs is
+ * "the gateway is up, and would it serve me", which is what this answers.
+ *
+ * `serveable` is the field to gate on: master on and the resource enabled. A resource
+ * with `enabled: false` will refuse with 409 no matter how healthy it looks.
+ *
+ * @returns {object} health payload.
+ */
+function handleHealth() {
+  const config = getConfig();
+  const resources = {};
+
+  for (const [id, resource] of Object.entries(config.resources)) {
+    let state = 'unknown';
+    try {
+      state = resource.enabled ? registry.entry(id).state : 'disabled';
+    } catch {
+      // A resource added to config after startup has no runtime record yet; it is
+      // still reportable, just not yet tracked.
+      state = 'untracked';
+    }
+    resources[id] = {
+      enabled: resource.enabled === true,
+      state,
+      serveable: (config.master?.enabled ?? true) && resource.enabled === true,
+    };
+  }
+
+  return {
+    ok: true,
+    master: config.master?.enabled ?? true,
+    uptimeSec: Math.round(process.uptime()),
+    resources,
+  };
+}
+
 async function handleImage(body) {
   const id = body.resource ?? 'image';
   const started = Date.now();
@@ -264,7 +339,12 @@ async function handleImage(body) {
       ok: true,
       workflow: workflowName,
       promptId: result.promptId,
+      // ComfyUI's own file list, kept for callers that already speak it.
       images: result.images,
+      // The uniform shape: absolute path, so a caller need not know which endpoint it
+      // called to know where the file is.
+      artifacts: artifactsFor(outputDirFor(getConfig(), resource), result.images, 'image'),
+      outputDir: outputDirFor(getConfig(), resource),
       elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
     };
   });
@@ -291,7 +371,10 @@ async function handleSpeak(body) {
         ok: true,
         backend: 'gsv',
         file,
+        filename: name,
         bytes: spoke.bytes.length,
+        artifacts: artifactsFor(outDir, [name], 'audio'),
+        outputDir: outDir,
         elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
       };
     }
@@ -299,12 +382,15 @@ async function handleSpeak(body) {
     if (resource.backend === 'comfy') {
       const graph = breeze.buildGraph(body);
       const result = await comfy.runWorkflow(baseUrl(resource), graph, body.timeoutSec ?? 900);
+      const dir = outputDirFor(getConfig(), resource);
       return {
         ok: true,
         backend: 'comfy',
         mode: body.mode ?? 'design',
         promptId: result.promptId,
         audio: result.audio,
+        artifacts: artifactsFor(dir, result.audio, 'audio'),
+        outputDir: dir,
         elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
       };
     }
@@ -392,7 +478,10 @@ async function dispatch(request, response) {
   const path = url.pathname;
   const method = request.method ?? 'GET';
 
-  if (!path.startsWith('/api/')) {
+  // `/health` sits outside the `/api/` prefix on purpose - it is the path every
+// supervisor already tries - so it has to be let past the static-file branch rather
+// than served as a missing file.
+  if (!path.startsWith('/api/') && path !== '/health') {
     if (method !== 'GET') {
       response.writeHead(405);
       response.end('method not allowed');
@@ -418,6 +507,10 @@ async function dispatch(request, response) {
   }
 
   const routes = {
+    // Liveness. Cheap on purpose: no backend probing, so a supervisor or a caller's
+    // readiness check can poll it without touching a model.
+    'GET /health': () => handleHealth(),
+
     'GET /api/status': () => handleStatus(),
     'GET /api/gpu': () => readGpu({ fresh: true }),
     'GET /api/config': () => getConfig(),

@@ -175,6 +175,7 @@ E:\B\lm-gateway\
 | `workflow` | comfy 生图 | 默认工作流文件名 |
 | `inject` | comfy 生图必填 | 默认注入点：`{"prompt": {"node": "4", "field": "prompt"}}` |
 | `injectByWorkflow` | 可选 | 按工作流覆盖注入点，**换工作流必查**（见下） |
+| `outputDir` | 可选 | 产物落盘目录。给 `comfy` 后端填 ComfyUI 的 output 目录（`E:\B\output`），用于把裸文件名拼成绝对路径 |
 
 ### `inject` / `injectByWorkflow`：为什么必须显式声明
 
@@ -242,6 +243,7 @@ Base：`http://127.0.0.1:8790`
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET` | **`/health`** | **探活，不碰后端**。返回 `{ok, master, uptimeSec, resources{id:{enabled,state,serveable}}}`。`serveable` = 总控开且该资源 enabled，调用它不会被 409 拒绝。**注意 `state:"idle"` 是正常状态**——本网关不常驻任何模型 |
 | `GET` | `/api/status` | 全部资源 + 显存 + 总控 + 队列 + 互斥组归属 |
 | `GET` | `/api/gpu` | 实时显存（无 `usableMiB`/`headroomMiB`，那两项在 status 里） |
 | `GET` | `/api/config` | 当前完整配置 |
@@ -318,7 +320,26 @@ Base：`http://127.0.0.1:8790`
 }
 ```
 
-响应：`{ok, workflow, promptId, images: ["qwen21_00001_.png"], elapsedSec}`
+响应：
+
+```jsonc
+{
+  "ok": true,
+  "workflow": "qwen21-image.json",
+  "promptId": "...",                          // 可用于向 ComfyUI 的 /history 核对该图实际内容
+  "images": ["qwen21_00001_.png"],            // 裸名，ComfyUI 语义，兼容既有调用方
+  "artifacts": [                               // 统一形态：带绝对路径
+    { "type": "image", "filename": "qwen21_00001_.png", "path": "E:\\B\\output\\qwen21_00001_.png" }
+  ],
+  "outputDir": "E:\\B\\output",
+  "elapsedSec": 137.5
+}
+```
+
+**所有产出文件的端点都返回 `artifacts`**（`/api/image`、`/api/speak`），元素形如
+`{type, filename, path}`。此前 `/api/image` 只给裸名、`/api/speak` 给绝对路径，
+调用方必须先知道自己调的是哪个端点才能打开结果——那个不一致现在没有了。
+`images` / `file` 作为兼容字段保留。
 
 **`POST /api/speak`**
 
@@ -495,3 +516,16 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
 | memory 无 `stop.waitSec` | 只配了 `url`，未声明等待上限 | 配置显式 `waitSec: 30` |
 | 测试假通过（三次） | 三个测试各自复制 `check()`，都声明三参数、调用传四参数，字符串落进 `passed` 位 → 断言恒为真 | 抽出唯一一份 `src/test-util.js`；签名不再有第二份可漂移 |
 | 测试通过却退出码 1 | `process.exit()` 在套接字关闭途中触发 libuv 断言，断言把退出码改成 1 | 改用 `exitWith()`（设 `exitCode` + 排空事件循环） |
+
+### 第三轮：来自 `dsh-canvas` 插件适配
+
+| 问题 | 实情 | 处置 |
+|---|---|---|
+| **prompt 对 anima 无效** | **网关侧在第二轮已修**（`injectByWorkflow` 按工作流选字段 + 字段不存在即报错）。**用 ComfyUI 的 `/history` 读回实际提交内容验证过**：marker 落在 `anima-image.json` 的 `4.text`，且未落进任何未读字段 | 插件侧的 `buildOverride()` 仍按需要保留（它还处理分辨率/seed 在不同工作流的字段位置），但**prompt 字段映射已不必再由插件承担** |
+| 图片给裸名、语音给绝对路径 | 确实不一致，调用方得先知道调的是哪个端点 | 两者统一返回 `artifacts: [{type, filename, path}]`；原有 `images`/`file` 保留兼容 |
+| 没有 `/health` | 合理需求 | 新增 `GET /health`：不碰后端，返回 `serveable`（总控开且该资源 enabled）；**`state:"idle"` 是正常状态**，本网关不常驻任何模型 |
+| `/api/status` 无 encoder 版本 | **第二轮已修** | 现返回 `resources[].encodeVersion`（实测 `"2-maskpool"`）与 `info` |
+
+**新增测试**：`src/test-prompt-delivery.js` —— 不只读配置，而是拿 `/api/image` 返回的
+`promptId` 去问 ComfyUI「你实际收到了什么」，再断言 marker 落在声明字段上。
+配置检查会漏掉这一类问题：注入错字段时图照跑不误、只是内容不对。

@@ -79,6 +79,30 @@ Content-Type: application/json; charset=utf-8
 
 ## 3. 状态与控制
 
+### 3.0 `GET /health` 探活（推荐先试这个）
+
+**不碰任何后端服务**，因此很快，适合监督进程或调用方的就绪检查每秒轮询。
+
+```json
+{
+  "ok": true,
+  "master": true,
+  "uptimeSec": 42,
+  "resources": {
+    "image":  { "enabled": true, "state": "idle", "serveable": true },
+    "breeze": { "enabled": true, "state": "idle", "serveable": true },
+    "tts":    { "enabled": true, "state": "idle", "serveable": true },
+    "memory": { "enabled": true, "state": "idle", "serveable": true }
+  }
+}
+```
+
+- **`state: "idle"` 是正常状态**，不是故障。本网关不常驻任何模型：用哪个拉哪个，用完按
+  `keepAliveSec` 释放。想看某个模型是否驻留，用 `/api/status`。
+- **`serveable`** = 总控开 **且** 该资源 `enabled`。这就是"资源存在且可用"的判据：
+  `serveable: false` 时调用它会拿到 `409`，而不是等它超时。
+- 总控关闭时 `ok` 仍为 `true`（网关本身活着），但所有 `serveable` 变 `false`。
+
 ### 3.1 `GET /api/status`
 
 全部资源状态 + 显存 + 总控 + 队列。WebUI 每 2 秒轮询它。`resources` 按 `priority` 升序排列。
@@ -234,28 +258,39 @@ Content-Type: application/json; charset=utf-8
   "workflow": "qwen21-image.json",
   "promptId": "d1f0c2a4-...",
   "images": [ "qwen21_00001_.png" ],
+  "artifacts": [
+    { "type": "image", "filename": "qwen21_00001_.png", "path": "E:\\B\\output\\qwen21_00001_.png" }
+  ],
+  "outputDir": "E:\\B\\output",
   "elapsedSec": 137.5
 }
 ```
 
-产物落在 ComfyUI 的输出目录（本机为 `E:\B\output\`）。实测：Qwen-Image 2.1 约
-**137 秒/张**、显存峰值约 **6800 MiB**（ComfyUI 需开 DynamicVRAM；关掉会退化到 638 秒）。
-Anima Turbo 约 **15–28 秒/张**、显存约 **4000 MiB**。
+`artifacts` 是**所有产出文件端点的统一形态**（`/api/image` 与 `/api/speak` 都有），
+带绝对路径。`images` 保留为兼容字段（裸名，ComfyUI 语义）。
+`promptId` 可用于向 ComfyUI 的 `/history/<promptId>` 核对这张图**实际收到了什么**。
 
-> **换成 Anima 时注意**：`inject.prompt` 是按 Qwen-Image 配的（节点 `"4"` 的 `prompt` 字段），
-> 而 Anima 的文本字段叫 `text`（正向节点 `"4"`、负向节点 `"5"`）。所以
-> `{"workflow":"anima-image.json","prompt":"..."}` 里的 prompt 会写进一个 Anima 不认识的字段，
-> **不生效也不报错**，出图用的还是工作流文件里的默认 tag。走 Anima 请显式用 override：
+产物落在资源的 `outputDir`（本机为 `E:\B\output\`）。实测：Qwen-Image 2.1 约
+**137 秒/张**、显存峰值约 **7177 MiB**（ComfyUI 需开 DynamicVRAM；关掉会退化到 638 秒）。
+Anima Turbo 约 **20–45 秒/张**。
 
-```json
-{
-  "workflow": "anima-image.json",
-  "override": {
-    "4": { "text": "masterpiece, best quality, 1girl, solo, lazy, sleepy, cozy room, manga style" },
-    "5": { "text": "worst quality, low quality, blurry, watermark, text, photo, realistic" }
-  }
-}
-```
+> **换成 Anima 时不需要额外操作**：网关按工作流解析注入点，
+> `injectByWorkflow` 已把 `anima-image.json` 映射到节点 `"4"` 的 `text` 字段。
+> 若映射缺失或字段名不符，网关会**直接报错**（列出该节点实际有哪些字段），
+> 而不是把 prompt 写进一个没人读的字段——那样会**不生效也不报错**，出图用默认 tag。
+>
+> 用 `/history` 读回实际提交内容可以确认这一点（`src/test-prompt-delivery.js` 就是这么做的）。
+> 若仍需显式控制，override 依然有效且优先：
+>
+> ```json
+> {
+>   "workflow": "anima-image.json",
+>   "override": {
+>     "4": { "text": "masterpiece, best quality, 1girl, solo, lazy, sleepy, cozy room, manga style" },
+>     "5": { "text": "worst quality, low quality, blurry, watermark, text, photo, realistic" }
+>   }
+> }
+> ```
 
 > 另外 Anima 的文本编码器 `qwen_3_06b_base` **没有 CJK 词表**，中文只能以 UTF-8 字节碎片进入编码器，
 > 出图内容会跑偏（实测把一个"漫画风慵懒少女"的请求变成了比基尼写真 + 日语气泡）。

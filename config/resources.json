@@ -39,6 +39,7 @@
         "timeoutSec": 180
       },
       "workflow": "qwen21-image.json",
+      "outputDir": "E:\\B\\output",
       "inject": {
         "prompt": {
           "node": "4",
@@ -79,7 +80,8 @@
       "ready": {
         "url": "http://127.0.0.1:8188/system_stats",
         "timeoutSec": 180
-      }
+      },
+      "outputDir": "E:\\B\\output"
     },
     "tts": {
       "label": "语音 · GPT-SoVITS",

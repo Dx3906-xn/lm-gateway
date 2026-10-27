@@ -52,6 +52,11 @@ node src\main.js
 ## 调用示例
 
 ```powershell
+# 探活：不碰后端，很快。看 serveable 判断"能不能用"
+Invoke-RestMethod -Uri 'http://127.0.0.1:8790/health'
+```
+
+```powershell
 # 生图（中文正文按 UTF-8 字节发送，PowerShell 直接传中文会损坏）
 $body = [System.Text.Encoding]::UTF8.GetBytes('{"prompt":"生成一张漫画风格的慵懒少女"}')
 Invoke-WebRequest -Uri 'http://127.0.0.1:8790/api/image' -Method POST `
@@ -63,6 +68,17 @@ Invoke-WebRequest -Uri 'http://127.0.0.1:8790/api/image' -Method POST `
 node src\cli.js status
 ```
 
+**产出文件的统一形态**：`/api/image` 与 `/api/speak` 都返回
+
+```json
+"artifacts": [ { "type": "image", "filename": "qwen21_00001_.png", "path": "E:\\B\\output\\qwen21_00001_.png" } ]
+```
+
+带绝对路径，调用方不必先知道自己调的是哪个端点。`images` / `file` 作为兼容字段保留。
+
+**`state: "idle"` 是正常的**——本网关不常驻任何模型。`/health` 的 `serveable` 才是
+"这个资源现在能不能用"。
+
 ---
 
 ## 自测
@@ -73,6 +89,7 @@ node src\test-injection.js       # prompt 注入点（纯逻辑，秒级）
 node src\test-start.js image     # 冷启动真实拉起，长命令型（约 1 分钟）
 node src\test-start.js memory    # 冷启动真实拉起，常驻型（约 30 秒）
 node src\test-memory.js          # 记忆检索端到端 + encodeVersion（约 30 秒）
+node src\test-prompt-delivery.js # prompt 真的进了模型？用 ComfyUI /history 复核（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
 
