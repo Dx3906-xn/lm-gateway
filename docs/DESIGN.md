@@ -77,12 +77,26 @@ E:\B\lm-gateway\
 
 | 用途 | 端口 | 说明 |
 |---|---|---|
-| **网关 HTTP（API + WebUI）** | **8790** | 唯一对外入口 |
-| ComfyUI（生图 / Breeze） | 8188 | 由网关代管 |
+| **网关 HTTP（API + WebUI）** | **8790** | **唯一对外入口**，含 `/backends/<id>/…` 代理 |
+| ComfyUI（image / anima / breeze 三者互斥） | 8188 | 由网关代管；**三个资源共用，同一时刻只有一个在跑** |
 | GPT-SoVITS | 9880 | 由网关代管 |
 | embed-server 记忆检索 | 9820 | 由网关代管 |
 
-所有调用方只认 **8790**。后端端口是内部实现细节。
+**调用方只认 8790。** 后端端口是内部实现细节，但需要通过代理访问：
+
+```
+网关自身接口     http://127.0.0.1:8790/api/...
+WebUI            http://127.0.0.1:8790/
+后端原生接口     http://127.0.0.1:8790/backends/<id>/<path>
+```
+
+`<id>` 是 `image` / `anima` / `breeze` / `tts` / `memory`。例如原本要直连 8188 的
+`GET /system_stats`，现在是 `GET /backends/anima/system_stats`。
+
+**为什么 8188 有三个资源不是配置错误**：一个端口只能有一个监听者，所以
+`image`/`anima`/`breeze` 声明在同一 `exclusiveGroup` 里**互斥**——任一时刻只有一个能占用它。
+它们不是三个服务，而是同一个 ComfyUI 进程的三套启动参数（生图开 DynamicVRAM，
+Breeze 必须关，Anima 用另一张工作流）。
 
 ---
 
@@ -109,10 +123,24 @@ E:\B\lm-gateway\
       "stop":  { "script": "stop_services.ps1", "args": ["-Service", "comfy"] },
       "ready": { "url": "http://127.0.0.1:8188/system_stats", "timeoutSec": 180 },
       "workflow": "qwen21-image.json",
-      "inject": { "prompt": { "node": "4", "field": "prompt" } },
-      "injectByWorkflow": {
-        "anima-image.json": { "prompt": { "node": "4", "field": "text" } }
-      }
+      "outputDir": "E:\\B\\output",
+      "inject": { "prompt": { "node": "4", "field": "prompt" } }
+    },
+    "anima": {
+      "label": "生图 · Anima Turbo",
+      "enabled": true,
+      "exclusiveGroup": "comfy",
+      "port": 8188,
+      "backend": "comfy",
+      "vramMiB": 4000,
+      "priority": 45,
+      "keepAliveSec": 180,
+      "start": { "script": "start_comfy.ps1", "args": ["-ReserveVram", "0"] },
+      "stop":  { "script": "stop_services.ps1", "args": ["-Service", "comfy"] },
+      "ready": { "url": "http://127.0.0.1:8188/system_stats", "timeoutSec": 180 },
+      "workflow": "anima-image.json",
+      "outputDir": "E:\\B\\output",
+      "inject": { "prompt": { "node": "4", "field": "text" } }
     },
     "breeze": {
       "label": "语音 · Breeze TTS 2",
@@ -174,8 +202,13 @@ E:\B\lm-gateway\
 | `ready` | ✅ | 轮询直到就绪；`method` 默认 GET。**判定是"有 HTTP 响应"，不是"200"** |
 | `workflow` | comfy 生图 | 默认工作流文件名 |
 | `inject` | comfy 生图必填 | 默认注入点：`{"prompt": {"node": "4", "field": "prompt"}}` |
-| `injectByWorkflow` | 可选 | 按工作流覆盖注入点，**换工作流必查**（见下） |
+| `injectByWorkflow` | 可选 | 按工作流覆盖注入点，**同一资源跑多个工作流时必查**（见下）。现在 anima 已拆为独立资源，一般用 `inject` 就够 |
 | `outputDir` | 可选 | 产物落盘目录。给 `comfy` 后端填 ComfyUI 的 output 目录（`E:\B\output`），用于把裸文件名拼成绝对路径 |
+
+> **什么时候该拆成独立资源**：如果用户会分别启停/观察它，就必须独立。
+> Anima 原先只是 `image` 的一个 `workflow`，于是它在 WebUI 里没有自己的卡片、开关和拉起按钮
+> —— 用户报「anima 未见控制按钮」就是这个原因。判断标准不是"是不是同一个后端进程"，而是
+> **"用户会不会想单独控制它"**。共用后端端口由 `exclusiveGroup` 表达，不构成合并资源的理由。
 
 ### `inject` / `injectByWorkflow`：为什么必须显式声明
 
@@ -197,11 +230,14 @@ E:\B\lm-gateway\
 |---|---|---|---|
 | Qwen-Image 2.1 int8 | 7177 MiB | 2021 MiB | **5156 MiB** |
 | Breeze TTS 2 int8-hybrid | 6398 MiB | ~1150 MiB | **~5250 MiB** |
+| Anima Turbo v1.1（估） | ~5000 MiB | ~1000 MiB | ~4000 MiB |
 | GPT-SoVITS v2ProPlus | 3060 MiB | ~0 | ~3000 MiB |
 | embed-server | ~1200 MiB | — | ~1200 MiB |
 
-配置取 `5500` / `5400`：略高于实测增量，既能在真正紧张时拒绝，又不会因为几 MiB
+配置取 `5500` / `5400` / `4000`：略高于实测增量，既能在真正紧张时拒绝，又不会因为几 MiB
 的浮动误拒（实测过 `6500` 配 `headroom 300` 时差 8 MiB 就拒绝的窘境）。
+Anima 那个 `4000` 是估值不是实测——它和 `image` 同组互斥，任一时刻只有一个在跑，
+所以这个数字实际上不参与准入判断（组内互斥先于显存账本生效）。
 
 ### 显存账本规则
 
@@ -246,6 +282,7 @@ Base：`http://127.0.0.1:8790`
 | `GET` | **`/health`** | **探活，不碰后端**。返回 `{ok, master, uptimeSec, resources{id:{enabled,state,serveable}}}`。`serveable` = 总控开且该资源 enabled，调用它不会被 409 拒绝。**注意 `state:"idle"` 是正常状态**——本网关不常驻任何模型 |
 | `GET` | `/api/heartbeat` | 当前进程存活状态（`pid/at/activity/lastError/uptimeSec`） |
 | `POST` | `/api/shutdown` | 优雅停止：先停全部子服务再退出。`scripts/stop-gateway.ps1` 用它 |
+| **任意** | **`/backends/<id>/<path>?<query>`** | **反向代理到该资源的后端端口**，见 §6.2。这是「只暴露 8790」的关键 |
 | `GET` | `/api/status` | 全部资源 + 显存 + 总控 + 队列 + 互斥组归属 |
 | `GET` | `/api/gpu` | 实时显存（无 `usableMiB`/`headroomMiB`，那两项在 status 里） |
 | `GET` | `/api/config` | 当前完整配置 |
@@ -291,6 +328,10 @@ Base：`http://127.0.0.1:8790`
       "lastError": null,
       "yielded": false,
       "inflight": 0,
+      // `running` 是字面意义（端口有应答）；`active` 说明这个资源是否就是占用共用端口的那个。
+      // 三个资源共用 8188，`running` 会对三者同时为 true——那是不可能的状态（一个端口一个监听者）。
+      // 判断"到底哪个加载着"要用 `active`。
+      "active": false,
       // 仅 backend=embed。运行时为当前版本，未运行时为 null。
       "encodeVersion": "2-maskpool",
       // 最近一次观测到的版本，跨 idle 保留（进程内）。**缓存键用这个**。
@@ -346,6 +387,36 @@ Base：`http://127.0.0.1:8790`
 调用方必须先知道自己调的是哪个端点才能打开结果——那个不一致现在没有了。
 `images` / `file` 作为兼容字段保留。
 
+### 6.2 `/backends/<id>/…` 反向代理：只暴露 8790
+
+业务端点本来就只谈 8790，但**网关没包装的东西**（ComfyUI 的画布、`object_info`、某个
+特定 GGUF）以前仍需直连 8188/9880/9820。一台机器上三个端口、三套生命周期，正是本项目
+要消除的耦合。
+
+```
+GET  /backends/anima/system_stats
+GET  /backends/anima/object_info/KSampler
+POST /backends/image/prompt
+GET  /backends/tts/docs
+```
+
+规则：
+
+| 项 | 行为 |
+|---|---|
+| 目标 | `http://127.0.0.1:<resource.port>/<path>`，路径与查询串原样透传 |
+| 准入 | **必须**经 `scheduler.run`：资源关闭时返回 409、总控关闭时返回 409、显存不足时 503，与业务端点**完全一致** |
+| 隐存 | 代理访问会取消待执行的 idle 释放（等于"有人在用它"） |
+| 副作用 | 资源没起来会自动拉起（这就是不必知道后端端口的原因） |
+| 响应 | 状态码与 `Content-Type` 透传，body 原样流回，**不做任何改写** |
+| 未知名 | 返回 404 并列出可用 id |
+
+**代理不是后门**：它不绕过开关、不绕过显存预算、不绕过互斥。测试里有三条断言专门锁这点
+（关闭时 409 + `reason:"resource"`、未知资源 404、真实转发 200）。
+
+**为什么不直接放开后端端口给调用方**：那样每个调用方都要自己判"服务起没起、能不能起、
+该不该让位"，而这套判断在网关里只有一份。暴露三个端口等于把这份逻辑复制到每个客户端。
+
 **`POST /api/speak`**
 
 GSV（`resource: "tts"`）**必须给 `refAudioPath`**（每次从参考音频克隆，没有默认值）
@@ -393,7 +464,8 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 ## 7. 调度规则
 
 1. **串行化**：同一时刻只有一个资源在"启动中"，避免并发启动竞争。
-2. **优先级**：`tts(10) > memory(20) > breeze(30) > image(40) > video(50)`。
+2. **优先级**：`tts(10) > memory(20) > breeze(30) > image(40) > anima(45) > video(50)`。
+   anima 排最后：它最快（20–45 秒），最不需要优先满足；被它挤掉一张要两分钟的生图不划算。
 3. **让位**：显存不足时按 priority 从大到小停，且**不动有在飞请求的资源**。
 4. **keepAlive**：请求完成后按 `keepAliveSec` 定定时器；期间再来请求则取消。
    每次读最新配置，所以 WebUI 改完对**下一次释放**立即生效，无需重启。
@@ -415,6 +487,10 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 7. **队列视图**
 8. 每 2 秒轮询 `/api/status`；操作后立即刷新
 9. fetch 失败显示"网关未启动"横幅并自动重试，**不白屏**
+10. **端口必须标注是"后端端口"**：共用时显示 `8188（3 个共用）` 并说明互斥，
+    否则三张卡片写同一个数字会被读成配置错误
+11. **同一资源的控制要能独立操作**：不同工作流如果用户会分别启停，就必须拆成独立资源，
+    否则它只有别人卡片上的一个下拉框
 
 ---
 
@@ -444,6 +520,11 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 8 | 注入点不静默失效 | `test-injection` 13/13：anima 用 `text`、qwen21 用 `prompt`，写错字段被拒 |
 | 9 | 常驻服务（memory）能拉起并能停下 | `test-start memory` 10/10：冷启动 **10.9s**（修复前 120s 超时并杀掉健康进程） |
 | 10 | 记忆检索端到端可用 | `test-memory` 16/16：`encodeVersion="2-maskpool"`、中文向量可区分、排序正确、stop 释放端口 |
+| 11 | 共用端口的资源可独立控制 | `test-resources` 19/19：anima 有独立开关且生效、关闭时 409 |
+| 12 | 共用端口不会都报"在运行" | `test-resources`：同组至多一个 `active` |
+| 13 | 只暴露 8790 也能访问后端 | `test-resources`：`/backends/anima/system_stats` 200，`object_info` 嵌套路径 200 |
+| 14 | 代理不是后门 | `test-resources`：关闭时 409 + `reason:"resource"`、未知资源 404 |
+| 15 | 代理算"在用" | `test-resources`：代理访问后 keepAlive 重置为 180s |
 
 复跑：
 
@@ -453,6 +534,9 @@ node src\test-injection.js       # 注入点（纯逻辑，秒级）
 node src\test-start.js image     # 冷启动，长命令型（约 1 分钟）
 node src\test-start.js memory    # 冷启动，常驻型（约 30 秒）
 node src\test-memory.js          # 记忆检索端到端（约 30 秒）
+node src\test-prompt-delivery.js # prompt 真的进了模型（约 1 分钟）
+node src\test-resources.js       # 共用端口 / 独立控制 / 代理（约 1 分钟）
+node src\test-crash.js           # 并发压力（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
 
@@ -591,3 +675,24 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
 **不是缺陷**。GPT-SoVITS 的两个进程是父子关系（`venv-tts\Scripts\python.exe` → 
 `python312\python.exe`），同一条命令行：venv 的 `python.exe` 只有 255 KB，
 是 launcher，负责选解释器再 exec。这是 Windows 上 venv 的正常行为。
+
+### 第五轮：WebUI 的三个问题
+
+| 报告 | 实情 | 处置 |
+|---|---|---|
+| 语音与生图端口重合 | **不是重合，是共用**。`image`/`anima`/`breeze` 都驱动 ComfyUI 的 8188；一个端口只能有一个监听者，所以它们**必须互斥**。错的是展示：三张卡片都写"8188"，看起来像配错了 | 卡片改为 `8188（3 个共用）`，悬停列出成员并说明"任一时刻只有一个在运行、对外请用 8790" |
+| anima 没有控制按钮 | 它只是 `image` 资源的一个 `workflow`，不是独立资源，因此没有自己的卡片 | 拆成独立资源（`vramMiB 4000`、`priority 45`、`inject` 指向 `text`），现在有独立的开关/拉起/停止/保持时间 |
+| 占用端口过多，建议整合为一个路由 | 业务端点本来只谈 8790，但**网关没包装的路径**仍需直连后端端口 | 新增 `/backends/<id>/…` 反向代理（§6.2），8790 成为唯一需要的端口 |
+
+#### 附带修掉的一个真实缺陷：同组资源都报 `running`
+
+加了 anima 之后 `test-resources` 立刻抓到：`breeze` 和 `image` 同时报 `running: true`，
+**而它们共用一个端口——不可能两个都在跑**。
+
+根因是状态探测按资源做，而"端口有应答"对同组三个资源都成立。修法两层：
+
+1. **探测按组做一次**，不是按资源做三次；组内若无人持有归属，才把端口记到某个资源名下
+2. **新增 `active` 字段**：`running` 保持字面意义（端口有应答），`active` 说明**这个资源是否
+   就是占用该端口的那个**。判断"到底哪个加载着"必须用 `active`
+
+这不只是显示问题——一个会同时报告三个资源在运行的面板，会让人不相信它的其他任何输出。

@@ -62,6 +62,27 @@
     return Math.round(mib) + ' MiB';
   }
 
+  /**
+   * Which resources share this resource's backend port.
+   *
+   * Three of the five resources drive ComfyUI on 8188, and that is by design rather
+   * than a mistake: a port can only have one listener, so those three are declared
+   * mutually exclusive and only one can be up at a time. Showing a bare "8188" on all
+   * three read as a misconfiguration, so the card says how many share it and lists
+   * them on hover.
+   *
+   * @param {object} resource - one entry from /api/status.
+   * @returns {string[]} ids sharing that port, sorted, empty when not shared.
+   */
+  function sharedPortMembers(resource) {
+    var all = (latest && Array.isArray(latest.resources)) ? latest.resources : [];
+    if (resource.port === null || resource.port === undefined) return [];
+    return all
+      .filter(function (other) { return other && other.port === resource.port; })
+      .map(function (other) { return other.id; })
+      .sort();
+  }
+
   function pct(part, total) {
     if (typeof part !== 'number' || typeof total !== 'number' || total <= 0) return 0;
     var v = (part / total) * 100;
@@ -385,7 +406,22 @@
     refs.state.className = 'card__state ' + (STATE_BADGE[state] || 'badge');
     refs.state.textContent = stateText(state);
 
-    refs.port.textContent = (r.port === null || r.port === undefined) ? '—' : String(r.port);
+    // 端口展示要区分"后端进程端口"和"对外调用端口"，否则三个共用 8188 的资源
+    // 看起来像配置错误。共用不是错误：监听同一个端口的服务只能有一个进程，所以
+    // image/anima/breeze 通过 exclusiveGroup 互斥，同一时刻只有一个能占用它。
+    var backendPort = (r.port === null || r.port === undefined) ? null : String(r.port);
+    var sharedWith = sharedPortMembers(r);
+    if (backendPort === null) {
+      refs.port.textContent = '—';
+    } else if (sharedWith.length > 1) {
+      // 显示"8188（3 个资源共用）"并把成员列在悬停提示里。
+      refs.port.textContent = backendPort + '（' + sharedWith.length + ' 个共用）';
+      refs.port.title = '后端进程端口。以下资源互斥使用它：' + sharedWith.join('、') +
+        '\n任一时刻只有一个在运行。对外调用请用 8790。';
+    } else {
+      refs.port.textContent = backendPort;
+      refs.port.title = '后端进程端口。对外调用请用 8790（/api/...）';
+    }
     refs.vram.textContent = fmtMiB(r.vramMiB);
     refs.priority.textContent = (r.priority === null || r.priority === undefined) ? '—' : String(r.priority);
 

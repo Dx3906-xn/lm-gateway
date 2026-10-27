@@ -18,18 +18,44 @@
 | 字符集 | UTF-8 |
 | WebUI | 同端口，浏览器直接打开 `http://127.0.0.1:8790/` |
 
-网关统一管理四类资源，调用方不直连后端端口：
+网关统一管理五类资源，调用方**不直连后端端口**：
 
-| 资源 id | 名称 | 后端 / 端口 | 显存（实测峰值） | 优先级 | 默认保持 |
+| 资源 id | 名称 | 后端 / 端口 | 显存配置 | 优先级 | 默认保持 |
 |---|---|---|---|---|---|
 | `tts` | 语音 · GPT-SoVITS | gsv / 9880 | 5000 MiB | 10 | 300 s |
 | `memory` | 记忆检索 · Qwen3-Embedding-0.6B | embed / 9820 | 1200 MiB | 20 | 120 s |
-| `breeze` | 语音 · Breeze TTS 2 | comfy / 8188 | 6400 MiB | 30 | 180 s |
-| `image` | 生图 · Qwen-Image 2.1 | comfy / 8188 | 6800 MiB | 40 | 180 s |
+| `breeze` | 语音 · Breeze TTS 2 | comfy / 8188 | 5400 MiB | 30 | 180 s |
+| `image` | 生图 · Qwen-Image 2.1 | comfy / 8188 | 5500 MiB | 40 | 180 s |
+| `anima` | 生图 · Anima Turbo | comfy / 8188 | 4000 MiB | 45 | 180 s |
 
 `priority` 数字越小越优先；`keepAliveSec` 为 `0` 表示用完立即停、`-1` 表示常驻。
-`image` 与 `breeze` 共用 8188 且互斥（同一个 `exclusiveGroup: "comfy"`），
-区别在启动参数：生图必须开 DynamicVRAM，Breeze 必须关。
+
+**三个资源共用 8188 不是配置错误。** 一个端口只能有一个监听者，所以
+`image` / `anima` / `breeze` 声明在同一 `exclusiveGroup: "comfy"` 里**互斥**——
+任一时刻只有一个在跑。它们不是三个服务，而是同一个 ComfyUI 进程的三套配置：
+
+| 资源 | 为什么必须独占该进程 |
+|---|---|
+| `image` | Qwen-Image 需要 DynamicVRAM **开启**（137s vs 638s） |
+| `breeze` | Breeze 需要 DynamicVRAM **关闭**（40s vs 250s）——与生图相反 |
+| `anima` | 另一张工作流，文本字段名为 `text`（Qwen 是 `prompt`） |
+
+判断"到底哪个加载着"看 `/api/status` 的 `active` 字段，不是 `running`
+（`running` 只表示端口有应答，同组三个都会是 true）。
+
+### 不直连后端端口，改用代理
+
+网关没包装的后端原生接口（ComfyUI 的 `object_info`、`history`、画布等）通过：
+
+```
+http://127.0.0.1:8790/backends/<资源id>/<原路径>
+```
+
+例如 `GET http://127.0.0.1:8188/object_info/KSampler`
+→ `GET http://127.0.0.1:8790/backends/anima/object_info/KSampler`
+
+**代理不绕过任何规则**：资源关闭时 409、总控关闭时 409、显存不足时 503，与业务接口一致。
+详见 §4.4。
 
 ---
 
@@ -113,7 +139,7 @@ Content-Type: application/json; charset=utf-8
   "gateway": { "port": 8790, "uptimeSec": 42 },
   "gpu": {
     "totalMiB": 8188, "usedMiB": 1300, "freeMiB": 6888, "ok": true,
-    "headroomMiB": 300, "usableMiB": 6588
+    "headroomMiB": 128, "usableMiB": 6760
   },
   "resources": [
     {
@@ -134,22 +160,27 @@ Content-Type: application/json; charset=utf-8
       "lastUsedAt": null,
       "lastError": null,
       "yielded": false,
-      "inflight": 0
+      "inflight": 0,
+      "active": true
     }
   ],
+  "groups": { "gsv": "tts" },
   "queue": [ { "id": "q-1", "resource": "tts", "priority": 10, "waitingMs": 1200 } ]
 }
 ```
 
 - `state`：`idle` | `starting` | `ready` | `busy` | `stopping` | `disabled`
   （`enabled=false` 时恒为 `disabled`）。
-- `running`：`starting` / `ready` / `busy` 三者之一即为 true。
+- `running`：`starting` / `ready` / `busy` 三者之一即为 true。**字面意义：端口有应答。**
+- `active`：这个资源是否就是**当前占用共用端口的那个**。`image`/`anima`/`breeze` 共用 8188，
+  `running` 会对三者同时为 true（一个端口、三个资源都指向它），只有 `active` 为 true 的那个
+  才是真正加载着的。**判断"哪个在跑"用 `active`。** 不在共用组里的资源，两者一致。
 - `keepAliveRemainingSec`：保持窗口剩余秒数；没有定时器时为 `null`。
 - `yielded`：为腾显存被网关停掉过，**不会自动重启**，下次请求才拉起。
 - `inflight`：正在执行的请求数。
 - `groupActive` / `blockedByGroup`：同一 `exclusiveGroup` 里当前由谁在服务。
   两者都为 `null` 时表示端口活着但**不是网关起的**，因此无法判断加载的是哪套配置
-  （`image` 与 `breeze` 共用 8188 但启动参数相反）。
+  （三个 comfy 资源共用 8188 但启动参数不同）。
 - `encodeVersion` / `info`：**仅 `backend=embed` 且该资源在运行时出现**。`info` 是
   `/health` 的原始返回，`info.encodeVersion` 同时提升为顶层 `encodeVersion`。
   调用方的向量缓存**应当以它为键**：没有这个字段时只能用一个常量，于是换掉 embedding
@@ -406,6 +437,41 @@ Anima Turbo 约 **20–45 秒/张**。
 - 只给 `texts` 或只给 `query`+`candidates`，别的组合一律 500。
 - 后端是 1024 维的 Qwen3-Embedding-0.6B；`query` / `texts` 是中文时必须按 §2.2 发字节，
   否则不报错但向量全是垃圾。
+
+### 4.4 `/backends/<id>/<path>` 反向代理
+
+**8790 是唯一需要的端口。** 网关没包装的后端原生接口全部走这里：
+
+```
+任意方法  http://127.0.0.1:8790/backends/<资源id>/<原路径>?<原查询>
+```
+
+| 原地址（直连后端） | 经网关 |
+|---|---|
+| `GET 127.0.0.1:8188/system_stats` | `GET 127.0.0.1:8790/backends/anima/system_stats` |
+| `GET 127.0.0.1:8188/object_info/KSampler` | `GET 127.0.0.1:8790/backends/anima/object_info/KSampler` |
+| `POST 127.0.0.1:8188/prompt` | `POST 127.0.0.1:8790/backends/image/prompt` |
+| `GET 127.0.0.1:8188/history/<id>` | `GET 127.0.0.1:8790/backends/image/history/<id>` |
+| `GET 127.0.0.1:9880/docs` | `GET 127.0.0.1:8790/backends/tts/docs` |
+
+```powershell
+# 例如：查 ComfyUI 的节点定义，不需要知道 8188
+Invoke-RestMethod -Uri 'http://127.0.0.1:8790/backends/anima/object_info/KSampler'
+```
+
+**行为**
+
+| 项 | 说明 |
+|---|---|
+| 准入 | 与业务接口**完全一致**：资源关闭 → `409 reason:"resource"`；总控关闭 → `409 reason:"master"`；显存不足 → `503` |
+| 拉起 | 后端没起来会**自动拉起**（这就是不必知道后端端口的原因）——第一次访问可能等十几秒 |
+| 隐存 | 代理访问算"在用"，会**取消待执行的 idle 释放**并重置 keepAlive |
+| 透传 | 状态码、`Content-Type`、响应体原样返回，网关**不改写** |
+| 未知 id | `404`，并列出可用 id |
+| 请求体 | 支持 JSON（ComfyUI 的 `/prompt`）；不是流式上传代理 |
+
+**代理不是后门**：它不绕过开关、不绕过显存预算、不绕过互斥组。想验证这一点，
+把一个资源关掉再打它的代理路径，会拿到和业务接口一样的 409。
 
 ---
 

@@ -127,6 +127,22 @@ export function describe(config, id) {
     lastError: state.lastError,
     yielded: state.yielded,
     inflight: state.inflight,
+    /**
+     * Whether this resource is the one currently loaded on a shared port.
+     *
+     * Three resources drive ComfyUI on 8188, and a port has one listener, so at most one
+     * of them can be up. A readiness probe cannot tell which: it sees "something answers
+     * on 8188" for all three. Without this flag the status view reported `breeze` and
+     * `image` as both running at once - impossible, and exactly the kind of impossible
+     * that makes an operator distrust the whole panel.
+     *
+     * So: `running` stays literal (the port answers), and `active` says whether this
+     * resource is the one that answers there. For a resource in no shared group the two
+     * agree.
+     */
+    active: resource.exclusiveGroup
+      ? (groupActiveId(resource.exclusiveGroup) === id)
+      : (state.state === 'ready' || state.state === 'busy' || state.state === 'starting'),
   };
 }
 

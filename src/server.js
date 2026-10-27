@@ -135,10 +135,40 @@ async function handleStatus() {
   // probe that timed out was aborted mid-response - which the service sees as a client
   // disconnect and logs as an error even though it is healthy. The probe result is
   // cached briefly inside isReachable, so the WebUI's 2 s poll is not a hammer.
+  //
+  // One result per group, not per resource. Three resources drive ComfyUI on 8188, so a
+  // successful probe there says "the port is up" for all three - reporting all three as
+  // running was an impossible state (one port, one listener) and made the panel look
+  // broken. The group is probed once; whichever resource the gateway actually started
+  // keeps ownership, and if it started none, the port is marked up without being
+  // attributed to a particular configuration.
+  const probedGroups = new Map();
+
   await Promise.all(Object.keys(config.resources).map(async (id) => {
     const state = registry.entry(id);
     if (state.state !== 'idle') return;
+
     const resource = config.resources[id];
+    const group = resource.exclusiveGroup;
+
+    if (group) {
+      if (!probedGroups.has(group)) {
+        probedGroups.set(group, await lifecycle.isReachable(
+          resource.ready.url, resource.ready?.method ?? 'GET', 3_000,
+        ));
+      }
+      if (!probedGroups.get(group)) return;
+
+      // The group answers. Only adopt it as this resource if nobody owns it yet;
+      // otherwise a second resource in the same group would claim the same process.
+      if (registry.groupActiveId(group) === null) {
+        registry.setGroupActive(group, id);
+        registry.markExternal(id);
+        state.state = 'ready';
+      }
+      return;
+    }
+
     if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 3_000)) {
       registry.markExternal(id);
       state.state = 'ready';
@@ -515,6 +545,98 @@ async function serveStatic(response, relativePath) {
 }
 
 /**
+ * Forward a request to one backend service, so 8790 is the only port a caller needs.
+ *
+ * Why this exists: the business endpoints already spoke only to 8790, but the backend
+ * services still had to listen on their own ports (8188, 9880, 9820) and a client that
+ * wanted something the gateway did not wrap - ComfyUI's canvas, its object_info, a
+ * specific GGUF - had to know them. Three ports on one laptop, each with its own
+ * lifecycle, is exactly the coupling this project is meant to remove.
+ *
+ * So `/backends/<resource>/<path...>` is a thin proxy. It is NOT a second lifecycle
+ * manager: admittance still goes through the scheduler, which means a switched-off
+ * resource refuses here too, and registering interest still arms the idle release.
+ *
+ * The upstream response is streamed and the body is passed through untouched, because
+ * what travels over these paths is ComfyUI's own API - anything that rewrote it would
+ * have to track that API forever.
+ *
+ * @param {import('node:http').IncomingMessage} request - the incoming request.
+ * @param {import('node:http').ServerResponse} response - the response.
+ * @param {string} resourceId - which resource to reach.
+ * @param {string} rest - the path remainder, including any query string.
+ */
+async function proxyToBackend(request, response, resourceId, rest) {
+  const config = getConfig();
+  const resource = config.resources[resourceId];
+  if (!resource) {
+    return sendJson(response, 404, {
+      ok: false,
+      error: `unknown resource "${resourceId}"`,
+      available: Object.keys(config.resources),
+    });
+  }
+
+  // Refuse before doing any work, exactly as the business endpoints do: a switched-off
+  // resource must not be reachable through the back door either.
+  if (!config.master?.enabled) {
+    return sendJson(response, 409, {
+      ok: false,
+      error: 'master switch is off; every resource is disabled',
+      reason: 'master',
+    });
+  }
+  if (!resource.enabled) {
+    return sendJson(response, 409, {
+      ok: false,
+      error: `resource "${resourceId}" is switched off`,
+      reason: 'resource',
+      resource: resourceId,
+    });
+  }
+
+  const target = `http://127.0.0.1:${resource.port}/${rest}`;
+  heartbeat.noteActivity(`PROXY ${request.method} ${resourceId}/${rest.split('?')[0]}`);
+
+  // Buffer the request body: these are JSON control payloads, not uploads, and a streamed
+  // forward would need duplex handling that Node does not offer for fetch.
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+
+  // Same serialization and admittance as a normal call, so the model starts on demand and
+  // the idle timer is cancelled by the fact that somebody is using it.
+  const started = Date.now();
+  await scheduler.run(resourceId, async () => {
+    const upstream = await fetch(target, {
+      method: request.method,
+      headers: {
+        // Content-Type is forwarded because ComfyUI distinguishes JSON from form posts;
+        // Host and the rest of the hop-by-hop headers are deliberately not.
+        ...(request.headers['content-type'] ? { 'Content-Type': request.headers['content-type'] } : {}),
+      },
+      body,
+    });
+
+    const headers = {};
+    const type = upstream.headers.get('content-type');
+    if (type) headers['Content-Type'] = type;
+
+    const payload = Buffer.from(await upstream.arrayBuffer());
+    response.writeHead(upstream.status, headers);
+    response.end(payload);
+
+    log.info(`proxy ${request.method} /backends/${resourceId}/${rest.split('?')[0]} -> ` +
+      `${upstream.status} in ${Date.now() - started}ms`);
+  });
+  // Errors are deliberately not caught here: scheduler.run throws DisabledError or
+  // NoRoomError, and sendError (in the caller) maps those to the same 409/503 a business
+  // call would have produced. Swallowing them would make the back door behave differently
+  // from the front, which is how a "switched off" resource ends up usable by anyone who
+  // knows the proxy path.
+}
+
+/**
  * Dispatch one request.
  *
  * Hand-rolled rather than routed by a framework: the route table is small and fixed,
@@ -525,6 +647,15 @@ async function dispatch(request, response) {
   const url = new URL(request.url, `http://${request.headers.host ?? '127.0.0.1'}`);
   const path = url.pathname;
   const method = request.method ?? 'GET';
+
+  // `/backends/<id>/...` proxies to that resource's own port, so a caller never needs to
+  // know 8188/9880/9820. Checked before the static-file branch because the proxy is not a
+  // file, and before the `/api/` guard because it lives outside that prefix.
+  const proxyMatch = path.match(/^\/backends\/([^/]+)\/(.*)$/);
+  if (proxyMatch) {
+    const rest = proxyMatch[2] + (url.search || '');
+    return proxyToBackend(request, response, decodeURIComponent(proxyMatch[1]), rest);
+  }
 
   // `/health` sits outside the `/api/` prefix on purpose - it is the path every
 // supervisor already tries - so it has to be let past the static-file branch rather

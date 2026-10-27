@@ -34,13 +34,35 @@ powershell -ExecutionPolicy Bypass -File E:\B\lm-gateway\scripts\stop-gateway.ps
 
 | 用途 | 端口 |
 |---|---|
-| **网关（API + WebUI）** | **8790** |
-| ComfyUI（生图 / Breeze） | 8188 |
-| GPT-SoVITS | 9880 |
-| embed-server 记忆检索 | 9820 |
+| **网关（API + WebUI + 后端代理）** | **8790** |
+| ComfyUI（`image` / `anima` / `breeze` 三者互斥） | 8188 |
+| GPT-SoVITS（`tts`） | 9880 |
+| embed-server 记忆检索（`memory`） | 9820 |
 
-**调用方只认 8790。** 后端端口由网关代管，不要直连。
-完整端口表与 curl 示例见 [docs/PORTS.md](docs/PORTS.md)，接口细节见 [docs/API.md](docs/API.md)。
+**调用方只需要 8790。** 后端端口由网关代管：
+
+```
+网关接口      http://127.0.0.1:8790/api/...
+WebUI         http://127.0.0.1:8790/
+后端原生接口  http://127.0.0.1:8790/backends/<id>/<path>
+```
+
+`active` 常驻。完整端口表与 curl 示例见 [docs/PORTS.md](docs/PORTS.md)，接口细节见 [docs/API.md](docs/API.md)。
+
+### 为什么 8188 上有三个资源
+
+`image`（Qwen-Image）、`anima`（Anima Turbo）、`breeze`（Breeze TTS 2）**共用 8188 且互斥**。
+一个端口只能有一个监听者，所以任一时刻只有一个能跑——它们其实是同一个 ComfyUI 进程的三套配置：
+
+| 资源 | 为什么必须独占 |
+|---|---|
+| `image` | 需要 DynamicVRAM **开启**（137s vs 638s） |
+| `breeze` | 需要 DynamicVRAM **关闭**（40s vs 250s），与生图相反 |
+| `anima` | 另一张工作流，文本字段叫 `text`（Qwen 叫 `prompt`） |
+
+WebUI 上会显示成 `8188（3 个共用）`。**这不是配置错误**，是互斥声明。
+想知道当前是哪一个在跑，看 `/api/status` 的 `active` 字段（`running` 只表示端口有应答，
+同组三个都会是 true）。
 
 ---
 
@@ -62,6 +84,11 @@ powershell -ExecutionPolicy Bypass -File E:\B\lm-gateway\scripts\stop-gateway.ps
 ```powershell
 # 探活：不碰后端，很快。看 serveable 判断"能不能用"
 Invoke-RestMethod -Uri 'http://127.0.0.1:8790/health'
+```
+
+```powershell
+# 后端原生接口也不需要直连端口（例：查 ComfyUI 节点定义）
+Invoke-RestMethod -Uri 'http://127.0.0.1:8790/backends/anima/object_info/KSampler'
 ```
 
 ```powershell
@@ -98,6 +125,7 @@ node src\test-start.js image     # 冷启动真实拉起，长命令型（约 1 
 node src\test-start.js memory    # 冷启动真实拉起，常驻型（约 30 秒）
 node src\test-memory.js          # 记忆检索端到端 + encodeVersion（约 30 秒）
 node src\test-prompt-delivery.js # prompt 真的进了模型？用 ComfyUI /history 复核（约 1 分钟）
+node src\test-resources.js       # 共用端口/独立控制/8790 代理（约 1 分钟）
 node src\test-crash.js           # 并发/中断/轮询压力：网关是否还活着（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```

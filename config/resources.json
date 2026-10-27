@@ -55,6 +55,42 @@
         }
       }
     },
+    "anima": {
+      "label": "生图 · Anima Turbo",
+      "enabled": true,
+      "exclusiveGroup": "comfy",
+      "port": 8188,
+      "backend": "comfy",
+      "vramMiB": 4000,
+      "priority": 45,
+      "keepAliveSec": 180,
+      "start": {
+        "script": "start_comfy.ps1",
+        "args": [
+          "-ReserveVram",
+          "0"
+        ]
+      },
+      "stop": {
+        "script": "stop_services.ps1",
+        "args": [
+          "-Service",
+          "comfy"
+        ]
+      },
+      "ready": {
+        "url": "http://127.0.0.1:8188/system_stats",
+        "timeoutSec": 180
+      },
+      "workflow": "anima-image.json",
+      "outputDir": "E:\\B\\output",
+      "inject": {
+        "prompt": {
+          "node": "4",
+          "field": "text"
+        }
+      }
+    },
     "breeze": {
       "label": "语音 · Breeze TTS 2",
       "enabled": true,
@@ -85,7 +121,7 @@
     },
     "tts": {
       "label": "语音 · GPT-SoVITS",
-      "enabled": false,
+      "enabled": true,
       "exclusiveGroup": "gsv",
       "port": 9880,
       "backend": "gsv",
