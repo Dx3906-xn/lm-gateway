@@ -25,6 +25,7 @@ import * as comfy from './backends/comfy.js';
 import * as breeze from './backends/breeze.js';
 import * as gsv from './backends/gsv.js';
 import * as embed from './backends/embed.js';
+import * as heartbeat from './heartbeat.js';
 import { log } from './log.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -150,16 +151,40 @@ async function handleStatus() {
   // is keyed by encoder version, and without this field the only thing it can key on is
   // a constant - so replacing the embedding model would keep answering from vectors
   // built by the old one, silently.
+  //
+  // Two fields, not one, because a single nullable field is a trap for the caller: this
+  // resource is stopped most of the time by design, so `encodeVersion` would read as
+  // null on nearly every poll. A consumer keyed on it would then see the version
+  // flickering between "2-maskpool" and null and conclude the encoder keeps changing -
+  // which is how you make a cache invalidate permanently. So:
+  //
+  //   encodeVersion        what is running *now*; null when the service is not up
+  //   lastKnownEncodeVersion what it was the last time we could see it; survives idle
+  //
+  // A caller wants lastKnown for cache keys, and encodeVersion only when it needs to be
+  // certain the reading is current.
   await Promise.all(resources.map(async (entry) => {
     const resource = config.resources[entry.id];
     if (resource?.backend !== 'embed') return;
-    if (entry.state !== 'ready' && entry.state !== 'busy') return;
 
-    const info = await embed.health(`http://127.0.0.1:${resource.port}`);
-    entry.info = info;
-    // Promoted to the top level so a caller does not have to know which backend
-    // produced it.
-    entry.encodeVersion = info?.encodeVersion ?? null;
+    if (entry.state === 'ready' || entry.state === 'busy') {
+      const info = await embed.health(`http://127.0.0.1:${resource.port}`);
+      entry.info = info;
+      // Promoted to the top level so a caller does not have to know which backend
+      // produced it.
+      entry.encodeVersion = info?.encodeVersion ?? null;
+      if (entry.encodeVersion) rememberEncodeVersion(entry.id, entry.encodeVersion, info);
+    } else {
+      entry.encodeVersion = null;
+    }
+
+    const remembered = recallEncodeVersion(entry.id);
+    entry.lastKnownEncodeVersion = entry.encodeVersion ?? remembered?.encodeVersion ?? null;
+    // Says whether that value is live or remembered, so a caller never has to guess.
+    entry.encodeVersionSource = entry.encodeVersion ? 'live' : (remembered ? 'remembered' : null);
+    if (!entry.encodeVersion && remembered) {
+      entry.lastKnownEncodeVersionAt = remembered.at;
+    }
   }));
 
   return {
@@ -176,8 +201,31 @@ async function handleStatus() {
   };
 }
 
+/**
+ * The last encoder version each embedding resource reported.
+ *
+ * In memory on purpose: a restart means the services were restarted too, so a version
+ * remembered from a previous process is not evidence about this one. Within a process it
+ * is exactly what a cache key needs, because it survives the idle release that makes
+ * `encodeVersion` null most of the time.
+ *
+ * @type {Map<string, {encodeVersion: string, info: object, at: string}>}
+ */
+const encodeVersionMemory = new Map();
+
+/** Record the encoder identity we just observed. */
+function rememberEncodeVersion(id, encodeVersion, info) {
+  encodeVersionMemory.set(id, { encodeVersion, info, at: new Date().toISOString() });
+}
+
+/** What we last saw for this resource, if anything. */
+function recallEncodeVersion(id) {
+  return encodeVersionMemory.get(id) ?? null;
+}
+
 async function handleMaster(body) {
   if (typeof body.enabled !== 'boolean') throw new ValidationError('master requires boolean "enabled"');
+  heartbeat.noteActivity(`POST /api/master ${body.enabled ? 'ON' : 'OFF (stopping everything)'}`);
   const updated = setMaster(body.enabled);
 
   // Turning it off must free the card now, not at the next idle timeout: a user who
@@ -515,10 +563,27 @@ async function dispatch(request, response) {
     'GET /api/gpu': () => readGpu({ fresh: true }),
     'GET /api/config': () => getConfig(),
     'GET /api/logs': () => ({ entries: log.recent() }),
+    // The heartbeat is what says what the gateway was doing when it stopped; exposing it
+    // over HTTP means a caller can read it without knowing the on-disk layout.
+    'GET /api/heartbeat': () => heartbeat.current(),
     'GET /api/workflows': () => ({ workflows: comfy.listWorkflows() }),
     'POST /api/workflows/reload': () => ({ workflows: comfy.listWorkflows(true).keys?.() ?? [] }),
 
     'POST /api/master': (body) => handleMaster(body),
+    // Graceful stop, used by scripts/stop-gateway.ps1.
+    //
+    // Windows gives no usable SIGTERM to a detached process, so `Stop-Process` is a
+    // terminate - which would orphan the child services and leave their VRAM stranded.
+    // The response is sent before shutting down, so the caller sees an answer rather than
+    // a connection reset, and the actual exit happens after this turn of the loop.
+    'POST /api/shutdown': () => {
+      log.info('shutdown requested over HTTP');
+      setImmediate(() => {
+        const { requestShutdown } = globalThis.__lmGatewayShutdown ?? {};
+        if (typeof requestShutdown === 'function') requestShutdown('http');
+      });
+      return { ok: true, stopping: true };
+    },
     'POST /api/image': (body) => handleImage(body),
     'POST /api/speak': (body) => handleSpeak(body),
     'POST /api/search': (body) => handleSearch(body),
@@ -534,7 +599,16 @@ async function dispatch(request, response) {
   }
 
   const body = method === 'POST' ? await readJson(request) : {};
+
+  // Record what is being worked on before starting it. This is what makes a silent
+  // death diagnosable: the heartbeat file then says "handling POST /api/speak for tts"
+  // instead of the gateway simply stopping mid-log with nothing to go on. That is
+  // exactly what happened once - the log ended at "tts ready" and stderr was empty.
+  const label = `${method} ${path}${body?.resource ? ` (${body.resource})` : ''}`;
+  heartbeat.noteActivity(label);
+
   const result = await handler(body);
+  heartbeat.noteActivity(`${label} -> ${response.statusCode || 200}`);
   return sendJson(response, 200, result);
 }
 

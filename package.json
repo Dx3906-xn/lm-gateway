@@ -9,13 +9,16 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/main.js",
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-gateway.ps1",
+    "stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-gateway.ps1",
+    "dev": "node src/main.js",
     "status": "node src/cli.js status",
     "smoke": "node src/cli.js smoke",
     "test:injection": "node src/test-injection.js",
     "test:start": "node src/test-start.js",
     "test:memory": "node src/test-memory.js",
     "test:delivery": "node src/test-prompt-delivery.js",
+    "test:crash": "node src/test-crash.js",
     "measure:image": "node src/measure-image.js"
   },
   "dependencies": {},

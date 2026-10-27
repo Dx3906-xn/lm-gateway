@@ -12,13 +12,21 @@ ComfyUI 会把部分权重悄悄挪到内存，然后在生成中途死于一个
 ## 快速开始
 
 ```powershell
-cd E:\B\lm-gateway
-node src\main.js
+# 启动（必须用这个脚本，见下方说明）
+powershell -ExecutionPolicy Bypass -File E:\B\lm-gateway\scripts\start-gateway.ps1
+
+# 停止（先停子服务再退出，不会遗留显存）
+powershell -ExecutionPolicy Bypass -File E:\B\lm-gateway\scripts\stop-gateway.ps1
 ```
 
 然后打开 **http://127.0.0.1:8790/** —— WebUI 与 API 同一个端口。
 
 无依赖、无构建步骤：只用 Node 内置模块，`npm install` 不需要跑。
+
+> **不要用 `Start-Process` 直接起 `node src/main.js`。** 那样发起方就是父进程，
+> 它一退出网关会被连带回收，现象是「日志突然断掉、stderr 为空」——看起来像崩溃，
+> 其实是被连坐。`start-gateway.ps1` 用 WMI 把网关挂到服务宿主下，与任何 shell 解耦。
+> 同理不要用 `Stop-Process` 硬杀，那会遗留子服务占着显存。
 
 ---
 
@@ -90,10 +98,25 @@ node src\test-start.js image     # 冷启动真实拉起，长命令型（约 1 
 node src\test-start.js memory    # 冷启动真实拉起，常驻型（约 30 秒）
 node src\test-memory.js          # 记忆检索端到端 + encodeVersion（约 30 秒）
 node src\test-prompt-delivery.js # prompt 真的进了模型？用 ComfyUI /history 复核（约 1 分钟）
+node src\test-crash.js           # 并发/中断/轮询压力：网关是否还活着（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
 
 验收标准的逐条证据见 [docs/DESIGN.md](docs/DESIGN.md) §10。
+
+---
+
+## 排障：网关不见了怎么办
+
+`output/logs/heartbeat.json` 是死因记录。它每 5 秒写一次（pid / 时间 / 当前操作），
+**干净退出会重写为 `cleanExit: true`**。所以：
+
+- 下次启动打印 `previous run ended without a clean shutdown (...)`
+  → 上次是被外部终止的，括号里给出最后时间、停了多久、以及**最后在处理什么请求**
+- 日志停在某一行、`stderr` 是 0 字节、又没有 `uncaughtException` 记录
+  → 不是 JS 异常，看是不是用 `Start-Process` 起的（见上方警告）
+
+`stop_services.ps1` 用来回收可能被遗留的子服务显存。
 
 ---
 

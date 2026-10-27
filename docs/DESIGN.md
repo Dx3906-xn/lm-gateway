@@ -244,6 +244,8 @@ Base：`http://127.0.0.1:8790`
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | **`/health`** | **探活，不碰后端**。返回 `{ok, master, uptimeSec, resources{id:{enabled,state,serveable}}}`。`serveable` = 总控开且该资源 enabled，调用它不会被 409 拒绝。**注意 `state:"idle"` 是正常状态**——本网关不常驻任何模型 |
+| `GET` | `/api/heartbeat` | 当前进程存活状态（`pid/at/activity/lastError/uptimeSec`） |
+| `POST` | `/api/shutdown` | 优雅停止：先停全部子服务再退出。`scripts/stop-gateway.ps1` 用它 |
 | `GET` | `/api/status` | 全部资源 + 显存 + 总控 + 队列 + 互斥组归属 |
 | `GET` | `/api/gpu` | 实时显存（无 `usableMiB`/`headroomMiB`，那两项在 status 里） |
 | `GET` | `/api/config` | 当前完整配置 |
@@ -289,9 +291,12 @@ Base：`http://127.0.0.1:8790`
       "lastError": null,
       "yielded": false,
       "inflight": 0,
-      // 仅 backend=embed 且运行时出现。向量缓存以编码器版本为键，缺了它调用方
-      // 只能用常量，于是换 embedding 模型后仍会用旧向量回答——错得很安静。
+      // 仅 backend=embed。运行时为当前版本，未运行时为 null。
       "encodeVersion": "2-maskpool",
+      // 最近一次观测到的版本，跨 idle 保留（进程内）。**缓存键用这个**。
+      "lastKnownEncodeVersion": "2-maskpool",
+      // "live" | "remembered" | null
+      "encodeVersionSource": "live",
       "info": { "ok": true, "model": "Qwen/Qwen3-Embedding-0.6B", "dim": 1024, "encodeVersion": "2-maskpool" }
     }
   ],
@@ -475,6 +480,11 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
   看成调用方掉线并记一条错误日志。探测结果现有 2.5 秒缓存，且并行执行；
   决策路径（是否要拉起）与就绪轮询都传 `fresh: true` 绕过缓存
 - `nvidia-smi` 的 `used + free ≠ total`；**用 `free` 判断可分配量**
+- **必须用 `scripts/start-gateway.ps1` 启动，不要用 `Start-Process`**：后者让发起方成为父进程，
+  父进程退出时网关被连带回收，表现为「静默退出、stderr 为空」。实测：`Start-Process`
+  起的进程下一次调用前即消失，WMI 起的长期存活
+- **必须用 `scripts/stop-gateway.ps1` 停止**：Windows 对无窗口进程没有可用 SIGTERM，
+  `Stop-Process` 是硬终止，会遗留子服务占着显存
 - `stop_services.ps1 -Service` 合法值：`all | comfy | tts`（不含 embed；memory 用 `/shutdown`）
 - 同端口的互斥资源**外部启动时无法区分是哪套配置**，`groupActive` 为 `null`
 - **测试脚本不要用 `process.exit()`**：Windows 上会在 HTTP 套接字关闭途中触发 libuv
@@ -529,3 +539,55 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
 **新增测试**：`src/test-prompt-delivery.js` —— 不只读配置，而是拿 `/api/image` 返回的
 `promptId` 去问 ComfyUI「你实际收到了什么」，再断言 marker 落在声明字段上。
 配置检查会漏掉这一类问题：注入错字段时图照跑不误、只是内容不对。
+
+### 第四轮：「网关静默退出」的调查结论
+
+**它没有崩溃。它被连坐杀掉了。**
+
+现象：16:15 在 `/api/speak` 期间网关整个消失，日志停在 `tts ready`，**stderr 0 字节**。
+
+推理链：stderr 为 0 且无 `uncaughtException` 记录 → **不是 JS 异常**（该处理器会先写日志）。
+剩下的只有"被外部终止"或"原生代码崩溃"。
+
+**实测定位**：用 `Start-Process` 起的进程，在下一次工具调用前就消失了；用
+`Win32_Process.Create`（父进程是 `WmiPrvSE`，不隶属任何交互式会话）起的进程长期存活。
+网关此前正是从 shell 工具调用里用 `Start-Process` 起的——**工具调用结束时整棵进程树被回收**。
+所以"静默退出、没有错误、没有 stderr"完全自洽：从进程内部看不到自己被终止。
+
+**修复**：
+
+| 项 | 做法 |
+|---|---|
+| 启动方式 | 新增 `scripts/start-gateway.ps1`，用 WMI 让网关挂到服务宿主下，与任何 shell 解耦 |
+| 优雅停止 | 新增 `POST /api/shutdown` + `scripts/stop-gateway.ps1`。Windows 对无窗口进程没有可用 SIGTERM，`Stop-Process` 是硬终止，会遗留子服务占着显存（曾见 5817 MiB 无人回收） |
+| 死因可查 | `src/heartbeat.js`：每 5 秒写 `output/logs/heartbeat.json`（pid/时间/当前操作）。干净退出会重写为 `cleanExit:true`；否则下次启动打印「上次非正常退出 + 时间 + 最后在做什么」 |
+| 单实例 | `output/logs/gateway.pid` 锁。两个网关会争抢同一批子服务，一个的 stop 会杀掉另一个正在生成的模型 |
+| 阻塞式关闭 | `server.close()` 加 3 秒上限，长连接不会让停止看起来像挂死 |
+
+**压测结论**（`src/test-crash.js`，6/6）：60 个并发请求、15 个中途断开的请求、
+10 Hz 状态轮询期间拉起服务——网关全部存活（uptime 156s）。**在正确的启动方式下无法复现，
+进一步佐证"外力终止"而非自身缺陷**。
+
+### 第四轮：`encodeVersion` 的契约陷阱
+
+原实现只在 `ready`/`busy` 时有值。这不是缺陷——服务没跑就没有版本可读——但对调用方是陷阱：
+本网关绝大多数时间让资源处于 `idle`，于是 `encodeVersion` 几乎永远读到 `null`，
+按它做缓存键会导致**缓存永久失效**（调用方原话：差点这么写）。
+
+改为两个字段，语义分开：
+
+| 字段 | 含义 |
+|---|---|
+| `encodeVersion` | **当前**运行的版本；服务未运行时为 `null` |
+| `lastKnownEncodeVersion` | **最近一次观测到**的版本；跨 idle 保留（进程内） |
+| `encodeVersionSource` | `"live"` / `"remembered"` / `null`，说明值从哪来 |
+| `lastKnownEncodeVersionAt` | 记忆值的时间戳（仅 `remembered` 时出现） |
+
+**缓存键应用 `lastKnownEncodeVersion`**；需要确认读数新鲜时才看 `encodeVersion`。
+记忆只在进程内存里：重启后服务也随之重启，旧版本对新服务不是证据。
+
+### 第四轮：双 python 进程
+
+**不是缺陷**。GPT-SoVITS 的两个进程是父子关系（`venv-tts\Scripts\python.exe` → 
+`python312\python.exe`），同一条命令行：venv 的 `python.exe` 只有 255 KB，
+是 launcher，负责选解释器再 exec。这是 Windows 上 venv 的正常行为。
