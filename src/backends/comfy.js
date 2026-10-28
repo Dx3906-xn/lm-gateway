@@ -200,13 +200,22 @@ function collectFiles(outputs) {
  * Polls `/history` rather than the websocket: it is one request per second against a
  * local server, and it survives a dropped connection without any reconnect logic.
  *
+ * Also reports when the prompt first stopped being queued. ComfyUI does not put a start
+ * timestamp in history (`status` holds only `status_str`, `completed` and `messages`), so
+ * the only observable boundary between "waiting for the model" and "the model working" is
+ * when `/queue` stops listing it. That distinction is the point of the timing fields: a
+ * first call that takes 70 s and a warm one that takes 3 s are the same amount of model
+ * work, and a caller reading `generateSec` needs to see that.
+ *
  * @param {string} base - ComfyUI base URL.
  * @param {string} promptId - from submit.
  * @param {number} timeoutSec - how long to wait.
- * @returns {Promise<{images: string[], audio: string[], raw: object}>}
+ * @returns {Promise<{images: string[], audio: string[], raw: object,
+ *   executingAt: number|null}>} `executingAt` is epoch ms, or null if never observed.
  */
 export async function waitForResult(base, promptId, timeoutSec = 900) {
   const deadline = Date.now() + timeoutSec * 1000;
+  let executingAt = null;
 
   while (Date.now() < deadline) {
     const response = await fetch(`${base}/history/${promptId}`);
@@ -228,14 +237,29 @@ export async function waitForResult(base, promptId, timeoutSec = 900) {
 
         const files = collectFiles(entry.outputs);
         if (files.images.length > 0 || files.audio.length > 0) {
-          return { ...files, raw: entry };
+          return { ...files, raw: entry, executingAt };
         }
 
         // Finished with no files: a graph that saves nothing. Report it rather than
         // spinning until the timeout.
         if (status.completed === true || status.status_str === 'success') {
-          return { ...files, raw: entry };
+          return { ...files, raw: entry, executingAt };
         }
+      }
+    }
+
+    // Still not finished. If it is no longer in /queue, it has been picked up - record
+    // when, once. A failure to read /queue is not fatal: an older ComfyUI, or a busy one,
+    // only costs the finer split, not the result.
+    if (executingAt === null) {
+      try {
+        const queue = await (await fetch(`${base}/queue`)).json();
+        const running = [...(queue?.queue_running ?? []), ...(queue?.queue_pending ?? [])];
+        const stillQueued = running.some((item) => Array.isArray(item) && item.includes(promptId));
+        const finished = Boolean((await (await fetch(`${base}/history/${promptId}`)).json())?.[promptId]);
+        if (!stillQueued && !finished) executingAt = Date.now();
+      } catch {
+        // Leaving it null costs precision in the split, nothing else.
       }
     }
 
@@ -248,13 +272,46 @@ export async function waitForResult(base, promptId, timeoutSec = 900) {
 /**
  * Submit and wait, the shape every caller actually wants.
  *
+ * `elapsedSec` is measured here rather than derived later, because this is the only place
+ * that sees both ends of the wait. It had been missing, and `/prompt`'s history therefore
+ * reported `elapsedSec: null` forever - a field that looks like data but never is, which is
+ * worse than not having it.
+ *
+ * Two numbers are reported, and the boundary between them is deliberate:
+ *   elapsedSec     the whole call, including starting the model if it was cold
+ *   generateSec    from when ComfyUI starts executing to when it finishes
+ *   loadSec        the difference, i.e. time spent waiting for the model to be resident
+ *
+ * The boundary is the first poll that finds the prompt executing, not the moment of
+ * submission. An earlier version measured from submission, which made the two numbers
+ * identical in every case: submitting is fast, and the model load happens inside the wait,
+ * so the split carried no information at all. A caller reading `generateSec` wants to know
+ * how long the model actually worked, which is what this now measures.
+ *
  * @param {string} base - ComfyUI base URL.
  * @param {object} graph - API-format workflow.
  * @param {number} timeoutSec - budget.
- * @returns {Promise<{images: string[], audio: string[], promptId: string}>}
+ * @returns {Promise<{images: string[], audio: string[], promptId: string,
+ *   elapsedSec: number, generateSec: number, loadSec: number}>}
  */
 export async function runWorkflow(base, graph, timeoutSec = 900) {
+  const startedAt = Date.now();
   const promptId = await submit(base, graph);
   const result = await waitForResult(base, promptId, timeoutSec);
-  return { ...result, promptId };
+  const finishedAt = Date.now();
+
+  const elapsedMs = finishedAt - startedAt;
+  const generateMs = result.executingAt !== null
+    ? Math.max(0, finishedAt - result.executingAt)
+    : elapsedMs;
+
+  return {
+    ...result,
+    promptId,
+    // Rounded to a tenth: callers compare these in seconds, and more precision would only
+    // suggest accuracy the measurement does not have.
+    elapsedSec: Number((elapsedMs / 1000).toFixed(1)),
+    generateSec: Number((generateMs / 1000).toFixed(1)),
+    loadSec: Number((Math.max(0, elapsedMs - generateMs) / 1000).toFixed(1)),
+  };
 }

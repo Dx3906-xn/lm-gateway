@@ -43,6 +43,24 @@ async function waitFor(promptId, timeoutSec = 900) {
   return null;
 }
 
+// --- 0. make sure the resources we need are switched on -------------------
+// Tests that flip a switch leave state in the config file, so a run of one script can
+// break another that ran later. Rather than depend on ordering, this records what it
+// found, enables what it needs, and puts it back at the end. A test that silently
+// depends on "some other test left this on" is a trap for whoever runs it next.
+section('0. prerequisites');
+const initial = await call('GET', '/api/status');
+const needEnabled = initial.body.resources.filter((resource) => resource.enabled !== true);
+if (needEnabled.length > 0) {
+  for (const resource of needEnabled) {
+    await call('POST', `/api/resources/${resource.id}`, { enabled: true });
+  }
+}
+check('every resource is enabled for this test',
+  needEnabled.length === 0 || (await call('GET', '/api/status')).body.resources
+    .every((resource) => resource.enabled === true),
+  needEnabled.map((resource) => resource.id).join(',') || 'all were already on');
+
 // --- 1. discovery ----------------------------------------------------------
 section('1. discovery');
 const models = await call('GET', '/models');
@@ -82,11 +100,16 @@ const animaGraph = {
   8: { class_type: 'VAEDecode', inputs: { samples: ['7', 0], vae: ['3', 0] } },
 };
 
+// Timestamped before submitting, so the client's own wall clock can be compared against
+// the gateway's elapsedSec. Without that comparison a timing field can be wrong by any
+// amount and still look plausible.
+const clientSubmittedAt = Date.now();
 const submitted = await call('POST', '/prompt', { prompt: animaGraph, client_id: 'test' }, 60);
 check('POST /prompt answers with a prompt_id', typeof submitted.body?.prompt_id === 'string',
   submitted.body?.prompt_id ?? JSON.stringify(submitted.body).slice(0, 160));
 
 const animaEntry = submitted.body?.prompt_id ? await waitFor(submitted.body.prompt_id) : null;
+const clientFinishedAt = Date.now();
 check('the execution completed', animaEntry?.status?.completed === true,
   animaEntry?.status?.status_str ?? 'no result');
 check('the gateway picked a model without being told',
@@ -102,6 +125,38 @@ const outputFiles = Object.values(animaEntry?.outputs ?? {})
   .map((image) => image?.filename)
   .filter(Boolean);
 check('an image file was produced', outputFiles.length > 0, outputFiles.join(', '));
+
+// Timing fields. `elapsedSec` was reported as null forever because runWorkflow did not
+// return a duration and comfyapi read a field that did not exist - a field that looks like
+// data but never is, which is worse than omitting it. Asserted here so it cannot regress
+// silently again.
+check('elapsedSec is a real number', typeof animaEntry?.elapsedSec === 'number',
+  `elapsedSec=${JSON.stringify(animaEntry?.elapsedSec)}`);
+check('elapsedSec is positive', (animaEntry?.elapsedSec ?? 0) > 0,
+  `${animaEntry?.elapsedSec}s`);
+check('generateSec is a real number', typeof animaEntry?.generateSec === 'number',
+  `generateSec=${JSON.stringify(animaEntry?.generateSec)}`);
+check('loadSec is a real number', typeof animaEntry?.loadSec === 'number',
+  `loadSec=${JSON.stringify(animaEntry?.loadSec)}`);
+check('generateSec + loadSec accounts for elapsedSec',
+  Math.abs(((animaEntry?.generateSec ?? 0) + (animaEntry?.loadSec ?? 0))
+    - (animaEntry?.elapsedSec ?? 0)) < 0.3,
+  `${animaEntry?.generateSec} + ${animaEntry?.loadSec} vs ${animaEntry?.elapsedSec}`);
+check('generateSec is not greater than elapsedSec',
+  (animaEntry?.generateSec ?? 0) <= (animaEntry?.elapsedSec ?? 0),
+  `generate ${animaEntry?.generateSec}s vs elapsed ${animaEntry?.elapsedSec}s`);
+check('startedAt and completedAt bracket the run',
+  Boolean(animaEntry?.startedAt) && Boolean(animaEntry?.completedAt)
+    && Date.parse(animaEntry.completedAt) >= Date.parse(animaEntry.startedAt),
+  `${animaEntry?.startedAt} -> ${animaEntry?.completedAt}`);
+
+// elapsedSec must reflect what the caller actually waited, cold start included. Measured
+// here against the client's own clock, because an earlier version started timing inside
+// runWorkflow and under-reported by exactly the cold start it was supposed to show.
+const clientMeasuredSec = (clientFinishedAt - clientSubmittedAt) / 1000;
+check('elapsedSec matches the client\'s own measurement',
+  Math.abs(clientMeasuredSec - (animaEntry?.elapsedSec ?? 0)) <= 3,
+  `client ${clientMeasuredSec.toFixed(1)}s vs gateway ${animaEntry?.elapsedSec}s`);
 
 // --- 3. a graph with Breeze nodes must not land on the image model --------
 // This is the failure the inference has to avoid: submitting audio nodes to a resource whose
@@ -148,5 +203,20 @@ section('5. no caller-visible backend port');
 // Everything above was addressed to :8790. The proxy is still there for escape hatches, but
 // it is no longer required for normal work - which is the whole point.
 check('the API base is the only address used', BASE.includes('8790'), BASE);
+
+// --- 6. put the switches back --------------------------------------------
+// Restore whatever was off before this ran, so the next script does not have to guess why
+// a resource it needs is disabled.
+section('6. cleanup');
+for (const resource of needEnabled) {
+  await call('POST', `/api/resources/${resource.id}`, { enabled: false });
+}
+if (needEnabled.length > 0) {
+  const restored = await call('GET', '/api/status');
+  check('switches restored to their earlier state',
+    needEnabled.every((resource) => restored.body.resources
+      .find((current) => current.id === resource.id)?.enabled === false),
+    needEnabled.map((resource) => resource.id).join(','));
+}
 
 exitWith(finish());

@@ -334,6 +334,29 @@ GET /history/a389bdaa-...
 **补全缺失的保存节点**：调用方给的图如果自带 `Save*` 节点，原样提交；如果没有（多数客户端
 只写"有意义的节点"），网关从该资源工作流里取出它的保存节点接上，这样输出才找得到。
 
+**计时字段**（`/history` 里每一条都带）：
+
+| 字段 | 含义 |
+|---|---|
+| `elapsedSec` | **调用方实际等待的总时长**，从 `/prompt` 被受理算起，含冷启动与让位腾显存 |
+| `generateSec` | ComfyUI 真正执行的时间 |
+| `loadSec` | 差值 = 排队 + 模型加载 + 启动服务 |
+| `startedAt` / `completedAt` | ISO 时间戳，客户端可自行算端到端 |
+
+三者关系恒为 `generateSec + loadSec ≈ elapsedSec`（测试里断言了这条）。
+
+**边界为什么这么划**：`elapsedSec` 从**受理**开始，不是从 ComfyUI 开始执行。第一版把
+计时起点放在 `runWorkflow` 内部，结果客户端实测 20.6 秒、网关报 7.2 秒——少的 13 秒正是
+冷启动，而那恰恰是这些字段存在的意义。冷启动示例：
+
+```
+elapsedSec 20.5 s   generateSec 7.1 s   loadSec 13.4 s   (客户端实测 20.6 s)
+```
+
+而 `generateSec` 的起点也不是提交时刻：ComfyUI 的 history `status` 里**没有**开始时间戳，
+只有 `status_str` / `completed` / `messages`。所以间隔靠**轮询 `/queue`、记录它不再排队的那一刻**
+来界定；取不到时退回"整个等待都算生成"，宁可粗略也不编造。
+
 **`classes` 字段**：为代码生成图的资源声明自己能跑的节点类。Breeze 的图是
 `backends/breeze.js` 每次请求现拼的，没有 JSON 可introspect，所以配置里显式列出——
 否则网关会以为没有任何模型能跑 Breeze 图。
@@ -581,7 +604,7 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 5 | `POST /api/image` 真正出图 | **实测 200，142.9s，`qwen21_00001_.png` 1024×1024** |
 | 6 | 新增资源只改 json | 配置校验器 `validateConfig` 0 problems |
 | 7 | 冷启动能拉起来 | `test-start`：冷启动 **16.6s**，无超时 |
-| 8 | 注入点不静默失效 | `test-injection` 13/13：anima 用 `text`、qwen21 用 `prompt`，写错字段被拒 |
+| 8 | 注入点不静默失效 | `test-injection` 15/15：anima 用 `text`、qwen21 用 `prompt`，写错字段被拒 |
 | 9 | 常驻服务（memory）能拉起并能停下 | `test-start memory` 10/10：冷启动 **10.9s**（修复前 120s 超时并杀掉健康进程） |
 | 10 | 记忆检索端到端可用 | `test-memory` 16/16：`encodeVersion="2-maskpool"`、中文向量可区分、排序正确、stop 释放端口 |
 | 11 | 共用端口的资源可独立控制 | `test-resources` 19/19：anima 有独立开关且生效、关闭时 409 |
@@ -595,6 +618,8 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 19 | 手写图能被自动路由并出图 | `test-comfyapi`：自造节点 id 的图 → `resource=anima`，产出 `dafiyu_00022_.png` |
 | 20 | 模型按节点类推断，不会误路由 | `test-comfyapi`：Breeze 图 → `resource=breeze`，不是 image |
 | 21 | 跑不了的图在加载前拒绝 | `test-comfyapi`：未知节点 → **400**，不是让模型先加载再报错 |
+| 22 | `/history` 的计时字段是真实数字 | `test-comfyapi` 26/26：`elapsedSec=4.1` 非 null；`generateSec + loadSec ≈ elapsedSec`；**且 `elapsedSec` 与客户端实测相差 ≤3 秒** |
+| 23 | 冷启动能被计时区分出来 | 实测 `elapsedSec 20.5 / generateSec 7.1 / loadSec 13.4`（客户端实测 20.6） |
 
 复跑：
 
@@ -810,3 +835,35 @@ score = -unused;
 `image`/`anima`/`breeze` 是同一个 ComfyUI 进程的三套配置。给它们各分一个端口会让
 "任一时刻只有一个在跑"这个保证失效——三个不同端口看起来就是三个独立服务，而它们不是。
 所以 `allocatePorts` 先按组分配，组内成员共享同一个号。
+
+### 第七轮：`elapsedSec` 恒为 null
+
+**报告**：`/prompt` 的 history 里 `elapsedSec` 永远是 `null`。
+
+**原因**：`comfy.runWorkflow` 返回 `{images, audio, promptId}`，**没有耗时字段**；
+`comfyapi.js` 写了 `result.elapsedSec ?? null`，这个 `?? null` 把一个不存在的东西
+伪装成了"暂时没有"——看起来像数据，实际永远不是。
+
+**修的过程中又发现一个更隐蔽的问题**：补上耗时后，客户端实测 20.6 秒、网关报 7.2 秒。
+差的那 13 秒正是冷启动——**而冷启动恰恰是这些字段存在的理由**。
+
+根因是计时起点放在了 `runWorkflow` 内部（等 ComfyUI 开始干活之后），但调用方等的是
+"从提交到出图"整段，其中包含网关让位腾显存、启动 ComfyUI、模型加载。起点必须放在
+`/prompt` **受理**那一刻。
+
+**第三个坑**：想让 `generateSec` 只算采样，就得知道 ComfyUI 什么时候开始执行。但实测
+history 的 `status` 只有 `status_str` / `completed` / `messages`，**没有任何时间戳**。
+所以改用**轮询 `/queue` 记录它不再排队的那一刻**；取不到就退回"整个等待都算生成"。
+
+**最终三个字段**（实测冷启动）：
+
+```
+elapsedSec 20.5 s   ← 调用方实际等待（含冷启动）
+generateSec 7.1 s   ← ComfyUI 真正执行
+loadSec    13.4 s   ← 排队 + 模型加载 + 启服务   (客户端实测 20.6 s)
+```
+
+测试里锁了三条，防止再退化成"看起来有值"：
+`elapsedSec` 是数字且为正、`generateSec + loadSec ≈ elapsedSec`、
+**`elapsedSec` 与客户端自测相差 ≤3 秒**（最后这条是关键——只断言"是数字"的话，
+一个恒为 7.2 的错误实现照样能通过）。

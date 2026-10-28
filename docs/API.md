@@ -18,19 +18,23 @@
 | 字符集 | UTF-8 |
 | WebUI | 同端口，浏览器直接打开 `http://127.0.0.1:8790/` |
 
-网关统一管理五类资源，调用方**不直连后端端口**：
+网关统一管理五类资源，调用方**不直连后端端口**（端口由网关动态分配）：
 
-| 资源 id | 名称 | 后端 / 端口 | 显存配置 | 优先级 | 默认保持 |
+| 资源 id | 名称 | 后端 | 显存配置 | 优先级 | 默认保持 |
 |---|---|---|---|---|---|
-| `tts` | 语音 · GPT-SoVITS | gsv / 9880 | 5000 MiB | 10 | 300 s |
-| `memory` | 记忆检索 · Qwen3-Embedding-0.6B | embed / 9820 | 1200 MiB | 20 | 120 s |
-| `breeze` | 语音 · Breeze TTS 2 | comfy / 8188 | 5400 MiB | 30 | 180 s |
-| `image` | 生图 · Qwen-Image 2.1 | comfy / 8188 | 5500 MiB | 40 | 180 s |
-| `anima` | 生图 · Anima Turbo | comfy / 8188 | 4000 MiB | 45 | 180 s |
+| `tts` | 语音 · GPT-SoVITS | gsv | 5000 MiB | 10 | 300 s |
+| `memory` | 记忆检索 · Qwen3-Embedding-0.6B | embed | 1200 MiB | 20 | 120 s |
+| `breeze` | 语音 · Breeze TTS 2 | comfy | 5400 MiB | 30 | 180 s |
+| `image` | 生图 · Qwen-Image 2.1 | comfy | 5500 MiB | 40 | 180 s |
+| `anima` | 生图 · Anima Turbo | comfy | 4000 MiB | 45 | 180 s |
 
 `priority` 数字越小越优先；`keepAliveSec` 为 `0` 表示用完立即停、`-1` 表示常驻。
 
-**三个资源共用 8188 不是配置错误。** 一个端口只能有一个监听者，所以
+> **后端端口不是固定的。** 配置里 `port: 0`，网关启动时绑定探测挑空闲端口，
+> 实际分配见启动日志 `ports allocated: image=8188, anima=8188, breeze=8188, tts=8189, memory=8190`。
+> 调用方不该依赖这些数字——用 `/models` 查，或干脆只走 8790。
+
+**三个 comfy 资源共用一个端口不是配置错误。** 一个端口只能有一个监听者，所以
 `image` / `anima` / `breeze` 声明在同一 `exclusiveGroup: "comfy"` 里**互斥**——
 任一时刻只有一个在跑。它们不是三个服务，而是同一个 ComfyUI 进程的三套配置：
 
@@ -42,6 +46,11 @@
 
 判断"到底哪个加载着"看 `/api/status` 的 `active` 字段，不是 `running`
 （`running` 只表示端口有应答，同组三个都会是 true）。
+
+### 主接口是 ComfyUI 的形状
+
+**推荐入口**是 §4.0 的 `/prompt` + `/history`：提交一张图，网关自己推断该用哪个模型。
+§4.1–4.3 的语义化接口（`/api/image` 等）保留兼容，但不再是首选。
 
 ### 不直连后端端口，改用代理
 
@@ -260,6 +269,79 @@ Content-Type: application/json; charset=utf-8
 ---
 
 ## 4. 业务接口
+
+### 4.0 ComfyUI 形状的接口（**推荐入口**）
+
+按 ComfyUI 的协议用：提交图 → 轮询结果。**模型由网关从图里的节点类推断**，你不说用哪个。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/prompt` | 提交 API 格式图，立刻返回 `{prompt_id, number, node_errors}` |
+| `GET` | `/history/<prompt_id>` | 轮询，ComfyUI 形状 |
+| `GET` | `/history` | 全部记录 |
+| `GET` | `/queue` | `{queue_running, queue_pending}` |
+| `POST` | `/interrupt` | 取消排队中的工作 |
+| `GET` | `/object_info` | 可提交的节点类（只列配置工作流实际用到的） |
+| `GET` | `/object_info/<class>` | 单个节点类 |
+| `GET` | `/models` | 资源与网关分配到的端口（非 ComfyUI 标准，调试用） |
+
+**`POST /prompt`**
+
+```jsonc
+{ "prompt": { "1": {"class_type":"UNETLoader","inputs":{...}}, ... },
+  "client_id": "my-client",        // 可选
+  "timeout_sec": 900 }             // 可选
+```
+
+响应（立即返回，不等待出图）：
+
+```jsonc
+{ "prompt_id": "a389bdaa-...", "number": 1, "node_errors": {} }
+```
+
+**图里不含 `Save*` 节点时，网关会补上**（从该资源的工作流里取），所以只写"有意义的节点"
+也能拿到产物。含 `Save*` 则原样提交。
+
+**`GET /history/<prompt_id>`**
+
+```jsonc
+{
+  "a389bdaa-...": {
+    "status": { "status_str": "success", "completed": true, "messages": [] },
+    "outputs": {
+      "anima": { "images": [ { "filename": "dafiyu_00038_.png", "subfolder": "", "type": "output" } ] }
+    },
+    "resource": "anima",            // 网关推断出的资源
+    "prompt": { ... },              // 原始图
+    "artifacts": [ { "type": "image", "filename": "dafiyu_00038_.png" } ],
+    "outputDir": "E:\\B\\output",
+    "elapsedSec": 20.5,             // 调用方实际等待（含冷启动）
+    "generateSec": 7.1,             // ComfyUI 真正执行
+    "loadSec": 13.4,                // 排队 + 模型加载 + 启服务
+    "startedAt": "2026-10-28T05:46:26.891Z",
+    "completedAt": "2026-10-28T05:46:47.000Z"
+  }
+}
+```
+
+**计时字段说明**（这三个是实测值，不是估算）：
+
+| 字段 | 含义 |
+|---|---|
+| `elapsedSec` | 从 `/prompt` **被受理**算起，含让位腾显存、启动服务、模型加载 |
+| `generateSec` | ComfyUI 真正执行的时间 |
+| `loadSec` | 差值 = 排队 + 模型加载 + 启服务 |
+
+关系恒为 `generateSec + loadSec ≈ elapsedSec`。冷启动示例：`20.5 / 7.1 / 13.4`；
+预热后再跑同一个模型会变成 `4.1 / 4.1 / 0`。
+
+**模型怎么选出来的**：图里每个 `class_type` 都必须存在于某资源的工作流（或其在
+`classes` 里声明的类），否则 **400 在模型加载前拒绝**。Breeze 图不会误路由到生图资源。
+
+```jsonc
+// 拒绝示例
+{ "ok": false, "error": "no configured model can run this graph: no resource's workflow contains all of its node classes (NotARealNode)" }
+```
 
 ### 4.1 `POST /api/image` 生图
 

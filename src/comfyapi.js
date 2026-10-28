@@ -222,6 +222,7 @@ export async function submitPrompt(body) {
   }
 
   const promptId = randomUUID();
+  const startedAtIso = new Date().toISOString();
 
   // Record it as running before handing off, so a poll arriving in the first millisecond
   // sees "queued" rather than a 404 that looks like a lost submission.
@@ -230,6 +231,7 @@ export async function submitPrompt(body) {
     outputs: {},
     resource: match.id,
     prompt: graph,
+    startedAt: startedAtIso,
   });
 
   heartbeat.noteActivity(`POST /prompt -> ${match.id}`);
@@ -237,10 +239,26 @@ export async function submitPrompt(body) {
   // Fire and forget: the HTTP response is sent as soon as this returns, matching ComfyUI.
   // A failure is recorded into the history entry rather than thrown, because the caller
   // is no longer listening - it will poll.
+  //
+  // Timing is measured from here, not from inside runWorkflow. Everything the caller waits
+  // for happens after this point: the scheduler may have to stop another model, free VRAM
+  // and start this one, and only then does ComfyUI begin. An earlier version started the
+  // clock inside runWorkflow and reported 7s for a call the client measured at 20s, with
+  // the missing 13 seconds being exactly the cold start the numbers were supposed to
+  // expose. `startedAtIso` above is the same instant, recorded for the history entry.
+  const acceptedAt = Date.now();
+
   void scheduler.run(match.id, async (resource) => {
     const composed = composeFor(resource, graph);
     const url = ports.backendUrl(resource);
     const result = await comfy.runWorkflow(url, composed, body.timeout_sec ?? body.timeoutSec ?? 900);
+
+    // Wall clock from acceptance through to the last byte of work, including the start.
+    const totalSec = Number(((Date.now() - acceptedAt) / 1000).toFixed(1));
+    // runWorkflow measured only ComfyUI's own execution, which is what "generate" means.
+    const generateSec = result.generateSec;
+    // What the gateway spent making the model available: scheduler admittance plus startup.
+    const loadSec = Number(Math.max(0, totalSec - generateSec).toFixed(1));
 
     const artifacts = [
       ...result.images.map((filename) => ({ type: 'image', filename })),
@@ -262,7 +280,17 @@ export async function submitPrompt(body) {
       prompt: graph,
       artifacts,
       outputDir: resource.outputDir ?? null,
-      elapsedSec: result.elapsedSec ?? null,
+      // Rolled up here rather than inside runWorkflow, because only this frame knows when the
+      // request was accepted - and the wait before that is the cold start a caller wants to
+      // see. `elapsedSec` is everything the caller waited; `generateSec` is ComfyUI working;
+      // `loadSec` is the difference, i.e. admittance plus model startup.
+      elapsedSec: totalSec,
+      generateSec,
+      loadSec,
+      // When the gateway accepted the submission, so a client can compute its own
+      // end-to-end figure without trusting the gateway's clock.
+      startedAt: startedAtIso,
+      completedAt: new Date().toISOString(),
     });
 
     log.info(`/prompt ${promptId} finished on ${match.id} (${result.images.length} image(s), ` +
