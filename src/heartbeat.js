@@ -20,7 +20,7 @@
  * fresh path and a rename is atomic enough for a single writer.
  */
 
-import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync, unlinkSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { paths } from './config.js';
 import { log } from './log.js';
@@ -148,14 +148,22 @@ export function noteError(message) {
   lastError = String(message ?? '').slice(0, 300);
 }
 
-/** Write the heartbeat once. */
+/** Write the heartbeat once, with enough of a picture to explain a death. */
 function beat(cleanExit = false) {
+  const memory = process.memoryUsage();
+
   const payload = {
     pid: process.pid,
     at: new Date().toISOString(),
     activity: lastActivity,
     lastError,
     uptimeSec: Math.round(process.uptime()),
+    // Written because the two unexplained deaths left nothing behind: no exception, no
+    // stderr, just a stopped process. A number that climbs before the stop is the difference
+    // between guessing and knowing, so the next occurrence has something to look at.
+    rssMiB: Math.round(memory.rss / (1024 * 1024)),
+    heapUsedMiB: Math.round(memory.heapUsed / (1024 * 1024)),
+    externalMiB: Math.round(memory.external / (1024 * 1024)),
     cleanExit,
   };
 
@@ -166,6 +174,17 @@ function beat(cleanExit = false) {
     renameSync(temporary, target);
   } catch {
     // A heartbeat that cannot be written must never break a request.
+  }
+
+  // A slow memory climb is invisible in a single sample, so keep a short history next to
+  // the heartbeat. Lines are cheap and capped, and a crash leaves the tail on disk.
+  if (!cleanExit) {
+    try {
+      const history = heartbeatPath().replace(/[^\\/]+$/, 'heartbeat-history.log');
+      appendFileSync(history, `${new Date().toISOString()} rss=${payload.rssMiB}M heap=${payload.heapUsedMiB}M ${lastActivity}\n`, 'utf8');
+    } catch {
+      // Same reasoning as above.
+    }
   }
 }
 

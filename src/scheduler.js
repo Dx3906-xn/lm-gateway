@@ -188,7 +188,56 @@ async function clearExclusiveGroup(config, id) {
 }
 
 /**
+ * Forget that a resource is running, because it is not.
+ *
+ * The state can go stale in ways the gateway has no callback for: the service crashes, its
+ * process is killed from outside, or ComfyUI exits during a run. Nothing notifies us, so the
+ * entry keeps saying `ready` while the port is gone. Callers then get a 500 from a dead
+ * socket and cannot tell "the model is broken" from "the gateway is reporting history".
+ *
+ * Measured case: breeze sat at `state: ready, running: true` with 8188 not listening, and
+ * the idle timer kept re-arming every three minutes - refreshing a claim about a process that
+ * had already exited. Recovering required a manual disable/enable cycle, which is the state
+ * the report describes.
+ *
+ * Clearing the timer matters as much as clearing the state: leaving it armed means an
+ * unrelated release fires later on whatever occupies the port by then.
+ *
+ * Exported because `/api/status` needs the same reset: the panel must not report a service
+ * as running when its port is gone, and a display that disagrees with the request path is
+ * worse than either alone.
+ *
+ * @param {string} id - resource id.
+ * @param {string} reason - why, for the log.
+ */
+export function forgetRunning(id, reason) {
+  const state = registry.entry(id);
+  if (state.state === 'idle') return;
+
+  const config = getConfig();
+  const resource = config.resources[id];
+
+  log.warn(`${id} was recorded as ${state.state} but is not answering; resetting to idle (${reason})`);
+
+  state.state = 'idle';
+  state.startedByUs = false;
+  state.startedAt = null;
+  state.backendBusy = false;
+  state.backendBusyDetail = null;
+  disarm(id);
+
+  if (resource?.exclusiveGroup) {
+    registry.clearGroupActive(resource.exclusiveGroup, id);
+  }
+}
+
+/**
  * Make sure a resource is running, then hand back.
+ *
+ * A recorded `ready` is verified rather than trusted. The check costs one local HTTP request
+ * (and `isReachable` caches it briefly), while trusting a stale flag costs the caller a
+ * failed request plus a confusing error - and, worse, leaves the service down until someone
+ * happens to toggle a switch by hand.
  *
  * @param {string} id - resource id.
  * @returns {Promise<void>}
@@ -198,7 +247,17 @@ async function ensureRunning(id) {
   const resource = config.resources[id];
   const state = registry.entry(id);
 
-  if (state.state === 'ready' || state.state === 'busy') return;
+  if (state.state === 'ready' || state.state === 'busy') {
+    // Verify before believing. `fresh` because this decides whether to start a second copy:
+    // a cached "no" would launch a duplicate of something already running, and a cached
+    // "yes" would let a dead service through.
+    const alive = await lifecycle.isReachable(
+      ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000, { fresh: true },
+    );
+    if (alive) return;
+
+    forgetRunning(id, 'recorded as ready but the port is not listening');
+  }
 
   // Already up but unrecorded (started by hand, or before this process existed).
   // fresh: whether to launch is a decision, so a cached probe must not answer it - a
@@ -403,6 +462,23 @@ function arm(id) {
         return;
       }
 
+      // Is it even still there?
+      //
+      // This check has to come before the "unknown" branch below, because a dead service
+      // produces exactly that answer: `refreshBackendBusy` cannot reach it, returns null, and
+      // the branch re-arms. The timer would then renew the claim forever, once per keepAlive -
+      // observed as "breeze will be released in 180s" every three minutes about a process that
+      // had already exited. Nothing ever cleared it; recovering took a manual disable/enable.
+      //
+      // A port that does not answer is not ambiguity, it is evidence. Act on it.
+      const alive = await lifecycle.isReachable(
+        ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000, { fresh: true },
+      ).catch(() => true);
+      if (!alive) {
+        forgetRunning(id, 'idle timer found the port closed');
+        return;
+      }
+
       // The backend may still be working on something whose HTTP request already
       // returned. Ask before stopping.
       const busy = await refreshBackendBusy(id).catch(() => null);
@@ -412,8 +488,9 @@ function arm(id) {
         return;
       }
       if (busy === null) {
-        // Could not tell. Not releasing is the safe direction: leaving a model resident
-        // costs VRAM until the next check, whereas stopping it destroys work in progress.
+        // Could not tell, and the port answers - so the service exists but its activity is
+        // unclear. Not releasing is the safe direction: leaving a model resident costs VRAM
+        // until the next check, whereas stopping it destroys work in progress.
         log.warn(`${id} backend activity unknown; not releasing this round`);
         arm(id);
         return;

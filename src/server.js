@@ -156,26 +156,70 @@ async function handleStatus() {
   // broken. The group is probed once; whichever resource the gateway actually started
   // keeps ownership, and if it started none, the port is marked up without being
   // attributed to a particular configuration.
-  const probedGroups = new Map();
+  // Probed for every resource, including the ones claiming to be up. Trusting a recorded
+  // `ready` is how the panel showed `breeze  state=ready  running=true` while 8188 was not
+  // listening - a stale flag refreshed every three minutes about a process that had already
+  // exited, recoverable only by toggling a switch by hand.
+  //
+  // The same group probe answers both directions: reachable and idle means "adopt it", idle
+  // and unreachable means "leave it", and claiming to be up while unreachable means "the
+  // flag is wrong, clear it".
+  const reachableGroups = new Map();
+
+  /**
+   * Is this resource's service actually answering?
+   *
+   * `fresh` when the resource claims to be up, because that is the case where a cached
+   * answer is dangerous: a stale "yes" keeps a dead service looking healthy, which is
+   * exactly the report. For a resource already known idle the cached answer is used, since
+   * the only decision there is whether to adopt an unexpected listener and being a couple of
+   * seconds late costs nothing.
+   *
+   * One probe per group, because three resources drive ComfyUI on one port.
+   */
+  function probeGroup(group, resource, fresh) {
+    const key = `${group}|${fresh ? 'fresh' : 'cached'}`;
+    if (!reachableGroups.has(key)) {
+      reachableGroups.set(key, lifecycle.isReachable(
+        ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000, { fresh },
+      ));
+    }
+    return reachableGroups.get(key);
+  }
 
   await Promise.all(Object.keys(config.resources).map(async (id) => {
     const state = registry.entry(id);
-    if (state.state !== 'idle') return;
-
     const resource = config.resources[id];
     const group = resource.exclusiveGroup;
+    // Only `ready` and `busy` are claims that the service is up. `starting` is the opposite
+    // kind of statement - it says a launch is in progress, so of course the port does not
+    // answer yet. Including it here made every status poll during a normal launch reset the
+    // entry to idle, which the log recorded as "breeze was recorded as starting but is not
+    // answering" - a correct observation of a healthy startup. The launch proceeds on its own
+    // and reports its own failure.
+    const claimsUp = state.state === 'ready' || state.state === 'busy';
 
+    const up = group
+      ? await probeGroup(group, resource, claimsUp)
+      : await lifecycle.isReachable(
+        ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000, { fresh: claimsUp },
+      );
+
+    if (claimsUp && !up) {
+      // The service is gone. Say so now rather than at the next request, and drop the idle
+      // timer with it - an armed timer would later fire a release against whatever occupies
+      // the port by then.
+      scheduler.forgetRunning(id, 'recorded as up but the port does not answer');
+      return;
+    }
+
+    if (!up) return;
+
+    // Something answers on this resource's address.
     if (group) {
-      if (!probedGroups.has(group)) {
-        probedGroups.set(group, await lifecycle.isReachable(
-          ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000,
-        ));
-      }
-      if (!probedGroups.get(group)) return;
-
-      // The group answers. Only adopt it as this resource if nobody owns it yet;
-      // otherwise a second resource in the same group would claim the same process.
-      if (registry.groupActiveId(group) === null) {
+      // Only adopt it as this resource if nobody owns it yet; otherwise a second resource in
+      // the same group would claim the same process.
+      if (state.state === 'idle' && registry.groupActiveId(group) === null) {
         registry.setGroupActive(group, id);
         registry.markExternal(id);
         state.state = 'ready';
@@ -183,7 +227,7 @@ async function handleStatus() {
       return;
     }
 
-    if (await lifecycle.isReachable(ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000)) {
+    if (state.state === 'idle') {
       registry.markExternal(id);
       state.state = 'ready';
     }
@@ -520,6 +564,10 @@ async function handleImage(body) {
       // Which resource served this. A caller that omitted `resource` can see where its
       // request went, and a caller that named one can confirm it was honoured.
       resource: id,
+      // Which engine. Present on every producing endpoint, not just speak: without it a
+      // caller had to know that only /api/speak reports a backend, and `comfy` alone does
+      // not identify a resource - image, anima and breeze all answer to it.
+      backend: resource.backend,
       workflow: workflowName,
       promptId: result.promptId,
       // ComfyUI's own file list, kept for callers that already speak it.
@@ -613,6 +661,7 @@ async function handleSearch(body) {
       return {
         ok: true,
         resource: id,
+        backend: resource.backend,
         ...result,
         elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
       };
@@ -632,6 +681,7 @@ async function handleSearch(body) {
       return {
         ok: true,
         resource: id,
+        backend: resource.backend,
         ranked,
         elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
       };

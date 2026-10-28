@@ -24,7 +24,9 @@
     "test:capability": "node src/test-capability.js",
     "test:crash": "node src/test-crash.js",
     "probe:widgets": "node src/probe-widgets.js",
-    "measure:image": "node src/measure-image.js"
+    "measure:image": "node src/measure-image.js",
+    "test:stale": "node src/test-stale.js",
+    "stress:status": "node src/stress-status.js"
   },
   "dependencies": {},
   "license": "MIT"

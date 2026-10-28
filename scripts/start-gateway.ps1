@@ -43,13 +43,37 @@ if (-not $node) {
 # directory and the quoted paths all have to survive being passed through WMI to cmd,
 # and building that as a single string is where quoting bugs live. A file sidesteps all
 # of it, and doubles as a record of exactly what was launched.
+#
+# The previous logs are rotated, not overwritten. The gateway has died twice with empty
+# stderr and no exception, and each time the restart erased the only evidence there was -
+# the tail of the log showing what it was doing. Diagnosing a process that cannot report
+# its own death requires keeping what it said last, so the old files are moved aside and
+# the last few runs are kept.
 $wrapper = Join-Path $logDir 'run-gateway.cmd'
+
+# Rotate: gateway.out.log -> gateway.1.out.log, shifting older ones down, keeping five.
+foreach ($suffix in @('.out', '.err')) {
+    $live = Join-Path $logDir "gateway$suffix.log"
+    if (-not (Test-Path $live)) { continue }
+    for ($index = 4; $index -ge 1; $index -= 1) {
+        $older = Join-Path $logDir "gateway.$index$suffix.log"
+        $newer = Join-Path $logDir "gateway.$($index + 1)$suffix.log"
+        if (Test-Path $older) { Move-Item -Force -Path $older -Destination $newer }
+    }
+    Move-Item -Force -Path $live -Destination (Join-Path $logDir "gateway.1$suffix.log")
+}
+
+$stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 $wrapperBody = @(
     '@echo off',
     "cd /d `"$root`"",
     "`"$node`" `"src/main.js`" > `"$outLog`" 2> `"$errLog`""
 ) -join "`r`n"
 Set-Content -Path $wrapper -Value $wrapperBody -Encoding ASCII
+
+# Record the start time so a death can be placed against the clock even when the log's own
+# timestamps are the last thing written.
+Add-Content -Path (Join-Path $logDir 'starts.log') -Encoding UTF8 -Value "$stamp  start"
 
 $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
     CommandLine      = "cmd.exe /c `"$wrapper`""

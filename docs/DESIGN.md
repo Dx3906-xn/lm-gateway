@@ -687,6 +687,10 @@ Breeze：
 | 31 | 多个可用时按 priority 选 | `test-capability`：tts 与 breeze 都启用时 → `tts`（10 < 30） |
 | 32 | 全部禁用时拒绝理由真实 | `test-capability`：409 且 `resource` 是真实候选（tts），不是编造的默认值 |
 | 33 | 能力不符时错误说清楚 | `test-capability`：让 breeze 生图 → `400 resource "breeze" cannot image; it can: speak` |
+| 34 | 死掉的进程不会被当成活的 | `test-stale` 22/22：`taskkill /F /T` 杀掉后端后，`state` 变 `idle`、`running=false`、计时器清空 |
+| 35 | 死掉后下一个请求自愈 | `test-stale`：杀掉后再调 `/api/speak` → **200**（不是 500），端口重新监听 |
+| 36 | idle 计时器自己清理死服务 | `test-stale`：keepAlive 6 秒，杀进程后**不发任何 status 请求**，到期后 `state=idle` |
+| 37 | 活着的服务不会被误清理 | `test-stale`：连续 3 次 status 轮询后状态不变；正常启动期间 `starting` 误报数 = 0 |
 
 复跑：
 
@@ -701,6 +705,8 @@ node src\test-resources.js       # 共用端口 / 独立控制 / 代理（约 1 
 node src\test-comfyapi.js        # ComfyUI 形状接口 + 模型推断（约 2 分钟）
 node src\test-busy.js            # 生成期间不被停用（约 2 分钟）
 node src\test-capability.js      # 能力路由（约 3 分钟，会真的合成一次语音）
+node src\test-stale.js           # 进程死亡后的状态自愈（约 2 分钟，会真的杀后端进程）
+node src\stress-status.js memory # 并发 status + start 压测（约 30 秒）
 node src\test-crash.js           # 并发压力（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
@@ -728,6 +734,13 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
   的逻辑都会在长图生成中途停掉服务
 - **ComfyUI 按图内容缓存**：相同 seed 的重复图约 1 秒返回，队列全程为空。
   测试要变 seed，否则观察不到忙碌窗口
+- **`ready` 必须被验证，不能被相信**：后端进程死亡没有任何回调通知。`ensureRunning`
+  和 `/api/status` 都会探端口；`starting` **不算**"声称活着"（端口当然还没监听）
+- **探测端口时"声称 up"要用 `fresh`**：`isReachable` 有 2.5 秒缓存，缓存会让刚死的
+  服务继续显示可达
+- **idle 计时器到期时先探端口再判"未知"**：死服务恰好探测失败（=未知），
+  而"未知则续命"的分支会让它每 keepAlive 自我续命一次、永远不清理
+- **重启脚本必须轮转日志**：曾两次无法诊断崩溃，因为每次启动都覆盖了崩溃现场
 - **冷启动**：ComfyUI 约 17–70 秒（视缓存）；GPT-SoVITS 约 70 秒
 - **`cuda_graphs` 模式会崩 ComfyUI**，Breeze 一律用 `eager`（代码内固定）
 - **启动命令的输出必须写文件不能走管道**：`Start-Process` 的子进程会继承管道，
@@ -1024,11 +1037,94 @@ Breeze 是特殊情况：它的图由 `backends/breeze.js` 代码现拼，原本
 连坐**（父 cmd.exe 活着，node 是它的前台子进程），所以与之前那次的结论不同。
 
 重启后 8 个测试套件全绿、网关稳定。**我没有定位到原因，也没有为了"看起来修好了"而
-改动任何东西**。上面那个 status 负载是唯一可疑的改动，已优化；但如果再次发生，
-现有证据不足以断言是它。
+改动任何东西**。
 
-下一步该做的（如果复发）：给 heartbeat 增加 RSS 与句柄数，让"内存/句柄耗尽"这类
-不可见原因留下数字。
+它后来又发生了一次（`uptimeSec: 0`，启动约 2 秒后消失）。**两次都无法诊断，因为重启
+脚本把日志覆盖了**——崩溃现场每次都恰好被下一次启动擦掉。
+
+所以这一轮先补的是**诊断能力**，不是猜原因：
+
+| 改动 | 为什么 |
+|---|---|
+| `start-gateway.ps1` 轮转日志（保留 5 次） | 崩溃的尾巴是唯一证据，覆盖等于销毁证据 |
+| `starts.log` 记启动时间 | 让死亡能和时钟对上 |
+| 心跳增加 `rssMiB` / `heapUsedMiB` / `externalMiB` | 单次采样看不出内存爬升，但爬升是"无异常死亡"最常见的原因 |
+| `heartbeat-history.log` 逐次追加 | 崩溃后磁盘上还留着最后几行 |
+
+**压力测试排除了一个怀疑**：每 200ms 轮询 `/api/status` 共 127 次，同时并发拉起
+`memory`，网关存活、`state=starting` 正常过渡到 `ready`。所以不是 status 并发导致。
+
+### 第十轮：进程死了，网关还认为它活着
+
+**报告**：
+
+```
+网关账本:  breeze  state=ready  running=true  port=8188
+实际端口:  8188 未监听
+```
+
+日志每 3 分钟还在刷 `breeze will be released in 180s unless used again`。调用方拿到 500，
+**且无法区分「资源真的坏了」和「网关状态是旧的」**；只能手动 disable → enable 才恢复。
+
+#### 三个独立缺陷叠在一起
+
+**① `ensureRunning` 无条件信任 `ready`**
+
+```js
+if (state.state === 'ready' || state.state === 'busy') return;   // 从不验证
+```
+
+服务怎么死的网关都不知道——崩溃、被外部 kill、ComfyUI 自己退出，**没有任何回调**。
+所以这个 `ready` 必须被验证而不是被相信。现在请求时探一次端口（本地 HTTP，1–2ms），
+不通就 `forgetRunning` 然后正常拉起。
+
+**② `/api/status` 只探测 idle 的资源**
+
+原逻辑是 `if (state.state !== 'idle') return;`——只关心「有没有人偷偷起了服务」，
+从不检查「声称活着的还活着吗」。所以面板会一直显示假状态。现在两个方向都探，
+**声称 up 时用 `fresh` 绕过 2.5 秒探测缓存**（缓存会让刚死的服务继续显示"可达"）。
+
+**③ idle 计时器在「未知」分支无限续命** ← 这就是"每 3 分钟刷新"
+
+```js
+if (busy === null) { arm(id); return; }   // 未知 → 重新计时
+```
+
+死掉的服务探测结果**恰好是 `null`**（连不上＝未知），于是每 3 分钟自我续命一次，
+永远不清状态。这个分支本身是对的（未知不该停，因为可能是正在生成），
+但**必须先排除"它根本不存在"**——端口不通不是未知，是证据。
+
+修法：计时器到期时先探端口，不通就 `forgetRunning` 并**清的计时器**；
+通了才进入"未知则续命"的保守分支。
+
+#### 修复时我自己引入的回归
+
+第一版把 `starting` 也算进「声称活着」，结果**正常启动过程中的服务被 status 轮询
+重置成 idle**。日志里一眼可见：
+
+```
+[warn] breeze was recorded as starting but is not answering; resetting to idle
+```
+
+`starting` 表达的是「正在启动」，端口当然还没监听——这是**正确的观察，错误的结论**。
+只有 `ready`/`busy` 才是"声称活着"。修掉后误报数为 0。
+
+**这个回归还差点让测试假通过**：`test-stale` 断言「state 不再是 ready」，而误重置
+让 state 变成 idle，测试就绿了——但它测的不是要测的东西。所以那条断言现在同时检查
+`keepAliveRemainingSec === null`，确认是**清理**而不是**误判**。
+
+#### 验证（`test-stale` 22/22）
+
+用 `taskkill /F /T` 直接杀掉后端进程树，**不经过网关**——这正是生产中的情形：
+网关是靠"发现"知道的，不是被通知的。
+
+| 场景 | 断言 |
+|---|---|
+| 进程被杀后 | 端口确实关闭（真的死了，不是假死） |
+| 下一次 `/api/status` | `state` 变 `idle`、`running=false`、`keepAliveRemainingSec=null` |
+| 下一次请求 | **200 而不是 500**，且自动重启成功 |
+| keepAlive 到期（6 秒） | **idle 计时器自己清理**，不需要任何 status 轮询 |
+| 活着的服务被反复轮询 | 状态保持不变（不能每次轮询都停模型） |
 
 ### 第七轮：`elapsedSec` 恒为 null
 

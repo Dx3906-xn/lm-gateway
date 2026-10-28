@@ -206,6 +206,11 @@ introspect，所以配置里显式列出它能跑的节点类，否则 `/prompt`
 - **`/prompt` 靠 `class_type` 推断模型**：自造节点类的图会被 400 拒绝，这是设计
 - **ComfyUI 的 `/queue` 看不到"正在执行"**：生成期间它是空的，所以网关靠**自己记的未完成
   执行**判断忙闲。这也是「生成到一半被停用」那个 bug 的根因
+- **后端进程死亡没有通知**：网关会探端口发现并自愈（下一次请求自动重新拉起），
+  不再需要手动 disable/enable。`/api/status` 也会即时反映
+- **日志会轮转保留 5 次**（`gateway.1.out.log` …）：崩溃现场不再被重启覆盖
+- **心跳带 `rssMiB` / `heapUsedMiB`**，逐次追加到 `heartbeat-history.log`：
+  如果网关再次"无声消失"，先看这两个数有没有爬升
 
 完整约束清单见 [docs/DESIGN.md](docs/DESIGN.md) §11。
 
