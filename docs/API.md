@@ -47,6 +47,47 @@
 判断"到底哪个加载着"看 `/api/status` 的 `active` 字段，不是 `running`
 （`running` 只表示端口有应答，同组三个都会是 true）。
 
+### 1.1 能力路由：`resource` 可以省略
+
+`/api/image`、`/api/speak`、`/api/search` 的 `resource` **全部可选**。省略时网关按
+**能力** 挑一个当前可用的资源，而不是回落到某个写死的 id。
+
+**能力不是 backend 名字**。三个资源都是 `backend: "comfy"`，只有 `breeze` 能出声：
+
+| 资源 | 能力 | 依据 |
+|---|---|---|
+| `image` | `image` | comfy + 有 workflow |
+| `anima` | `image` | comfy + 有 workflow |
+| `breeze` | `speak` | comfy + 节点类含 `BreezeTTS2*`（**无 workflow，不能生图**） |
+| `tts` | `speak` | gsv 后端 |
+| `memory` | `search` | embed 后端 |
+
+所以「按 `backend === 'gsv' \|\| backend === 'comfy'` 过滤」是错的：它会把 image、anima
+也算成语音候选，然后在内部失败。
+
+**挑选规则**
+
+1. 显式指定的 `resource` 一律尊重
+2. 否则在「有能力」且「enabled」的资源里按 `priority` 升序取第一个
+3. 全都 disabled → 仍返回优先级最高的那个，让 409 报出**真实的**资源名（不是编造的默认）
+
+**怎么知道会路由到哪里**
+
+```powershell
+Invoke-RestMethod -Uri 'http://127.0.0.1:8790/api/status' | Select-Object -ExpandProperty routing
+# speak  : @{ resource = breeze; allDisabled = False }
+# image  : @{ resource = image;  allDisabled = False }
+# search : @{ resource = memory; allDisabled = False }
+```
+
+`routing` 是**路由决策本身**，不是重新推导一遍，所以看到的就是网关真会做的。
+`allDisabled: true` 表示有能力但全被关了——此时调用会 409 并指出是哪个资源。
+
+**响应里的 `resource` 字段**说明实际服务的资源；`backend` 说明用的哪个引擎。
+两者不一定一一对应（资源 id 和引擎不是一回事）。
+
+配置里可以显式声明 `capabilities: ["speak"]` 覆盖推断，用于本网关不认识的 backend。
+
 ### 主接口是 ComfyUI 的形状
 
 **推荐入口**是 §4.0 的 `/prompt` + `/history`：提交一张图，网关自己推断该用哪个模型。
@@ -358,8 +399,8 @@ Content-Type: application/json; charset=utf-8
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `prompt` | | 正向提示词，注入到**资源配置 `inject.prompt` 指定的节点字段**（`image` → 节点 `"4"` 的 `prompt`） |
-| `workflow` | | 工作流文件名，默认取资源配置（`image` → `qwen21-image.json`） |
-| `resource` | | 资源 id，默认 `image`；该资源必须 `backend: "comfy"` 且有默认 `workflow` |
+| `workflow` | | 工作流文件名，默认取资源配置（`image` → `qwen21-image-api.json`） |
+| `resource` | | 资源 id；**省略则按能力路由**（见 §1.1），可能选中 `anima` 而不是 `image` |
 | `override` | | 按**节点 id** 覆盖工作流 `inputs` 字段，见 §6.3 |
 | `timeoutSec` | | 等待出图的上限，默认 900 |
 
@@ -368,7 +409,8 @@ Content-Type: application/json; charset=utf-8
 ```json
 {
   "ok": true,
-  "workflow": "qwen21-image.json",
+  "resource": "image",
+  "workflow": "qwen21-image-api.json",
   "promptId": "d1f0c2a4-...",
   "images": [ "qwen21_00001_.png" ],
   "artifacts": [
@@ -411,9 +453,14 @@ Anima Turbo 约 **20–45 秒/张**。
 
 ### 4.2 `POST /api/speak` 语音合成
 
-`resource` 默认 `tts`（GPT-SoVITS）。两条后端路径的字段完全不同。
+`resource` **可选**：省略时按能力路由（见 §1.1），在启用且能发声的资源里按 `priority`
+挑一个。响应里的 `resource` 说明实际用了谁。
 
-**A. `resource: "tts"`（GPT-SoVITS，默认）**
+> **注意两条后端路径的字段完全不同**。省略 `resource` 时网关会选其中一个，所以调用方
+> 要么传两种都认的字段，要么显式指定 `resource` 以确保参数对得上。
+> 实测场景：tts 关闭、breeze 启用时，省略 resource 的 `/api/speak` 会走 breeze。
+
+**A. GPT-SoVITS（`resource: "tts"`，需要参考音频）**
 
 ```json
 {
@@ -444,9 +491,15 @@ Anima Turbo 约 **20–45 秒/张**。
 ```json
 {
   "ok": true,
+  "resource": "tts",
   "backend": "gsv",
   "file": "E:\\B\\lm-gateway\\output\\audio\\speech-1761500000000.wav",
+  "filename": "speech-1761500000000.wav",
   "bytes": 123456,
+  "artifacts": [
+    { "type": "audio", "filename": "speech-1761500000000.wav", "path": "E:\\B\\lm-gateway\\output\\audio\\speech-1761500000000.wav" }
+  ],
+  "outputDir": "E:\\B\\lm-gateway\\output\\audio",
   "elapsedSec": 8.3
 }
 ```
@@ -454,10 +507,10 @@ Anima Turbo 约 **20–45 秒/张**。
 > `mode` 字段对 GPT-SoVITS **无效**（会被忽略）——它的"模式"是 `refAudioPath` + `promptText` 决定的。
 > 字段名同时接受 camelCase 与 snake_case（`ref_audio_path`、`prompt_text`、`text_lang` …）。
 
-**B. `resource: "breeze"`（Breeze TTS 2，跑在 ComfyUI 上）**
+**B. Breeze TTS 2（`resource: "breeze"`，跑在 ComfyUI 上，不需要参考音频）**
 
 ```json
-{ "resource": "breeze", "text": "老大 我今天不想动", "mode": "design", "instruction": "慵懒温柔的女声，语速偏慢" }
+{ "text": "老大 我今天不想动", "mode": "design", "instruction": "慵懒温柔的女声，语速偏慢" }
 ```
 
 | `mode` | 额外必填 | 含义 |
@@ -493,7 +546,7 @@ Anima Turbo 约 **20–45 秒/张**。
 ```
 
 ```json
-{ "ok": true, "vectors": [[0.013, -0.24, "..."]], "dim": 1024, "elapsedSec": 0.4 }
+{ "ok": true, "resource": "memory", "vectors": [[0.013, -0.24, "..."]], "dim": 1024, "elapsedSec": 0.4 }
 ```
 
 **B. 排序（给定候选，按相似度从高到低）**

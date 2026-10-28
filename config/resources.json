@@ -129,7 +129,7 @@
     },
     "tts": {
       "label": "语音 · GPT-SoVITS",
-      "enabled": true,
+      "enabled": false,
       "exclusiveGroup": "gsv",
       "port": 8189,
       "backend": "gsv",

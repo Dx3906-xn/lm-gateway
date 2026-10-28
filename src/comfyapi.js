@@ -66,10 +66,35 @@ const RETENTION_MS = 60 * 60 * 1000;
  * gateway would refuse every Breeze graph with "no configured model can run this", which is
  * what happened the first time this was wired up.
  *
+ * Exported because capability inference asks the same question: a ComfyUI resource can
+ * speak audio only if it can run the voice nodes, which is decided by exactly this list.
+ *
+ * Cached per workflow name, because the answer is expensive and the caller is a poll.
+ * `buildWorkflow` deep-clones the stored graph every time, and `/api/status` asks for the
+ * capability of every resource - three times, once per capability - on a two-second poll
+ * from the WebUI. Without the cache that is a dozen file reads and deep copies every two
+ * seconds for an answer that only changes when a workflow file is reloaded, which is
+ * already an explicit action (`POST /api/workflows/reload`).
+ *
+ * The cache is keyed by workflow name and invalidated by `loadWorkflows(true)`, which
+ * clears it, so reload still takes effect immediately.
+ *
  * @param {object} resource - a config entry.
  * @returns {Set<string>} class types.
  */
-function availableClasses(resource) {
+const classCache = new Map();
+
+export function availableClasses(resource) {
+  const cacheKey = resource.workflow ?? null;
+
+  if (cacheKey !== null && classCache.has(cacheKey)) {
+    const cached = classCache.get(cacheKey);
+    // Declared classes are merged in each time: they live on the resource, not the file, and
+    // two resources could share a workflow while declaring different extras.
+    if (!Array.isArray(resource.classes) || resource.classes.length === 0) return cached;
+    return new Set([...cached, ...resource.classes]);
+  }
+
   const classes = new Set(Array.isArray(resource.classes) ? resource.classes : []);
 
   if (resource.workflow) {
@@ -84,7 +109,20 @@ function availableClasses(resource) {
     }
   }
 
+  if (cacheKey !== null) classCache.set(cacheKey, classes);
+
   return classes;
+}
+
+/**
+ * Drop the class cache.
+ *
+ * Called when workflows are reloaded. Without it, a reloaded workflow would keep reporting
+ * the classes it had before the file changed, and capability routing would go on believing
+ * a resource can run nodes it no longer contains.
+ */
+export function clearClassCache() {
+  classCache.clear();
 }
 
 /**

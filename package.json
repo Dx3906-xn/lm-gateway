@@ -21,6 +21,7 @@
     "test:resources": "node src/test-resources.js",
     "test:comfyapi": "node src/test-comfyapi.js",
     "test:busy": "node src/test-busy.js",
+    "test:capability": "node src/test-capability.js",
     "test:crash": "node src/test-crash.js",
     "probe:widgets": "node src/probe-widgets.js",
     "measure:image": "node src/measure-image.js"

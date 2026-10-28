@@ -440,13 +440,64 @@ elapsedSec 20.5 s   generateSec 7.1 s   loadSec 13.4 s   (客户端实测 20.6 s
 | `POST` | `/api/speak` | 语音合成（GPT-SoVITS 或 Breeze） |
 | `POST` | `/api/search` | 记忆检索（嵌入或排序） |
 
+### 6.3 能力路由：不指定 resource 时由网关决定
+
+`/api/image`、`/api/speak`、`/api/search` 的 `resource` **全部可选**。省略时网关按
+**能力** 挑一个当前可用的，而不是回落到某个写死的 id。
+
+以前 `/api/speak` 是 `body.resource ?? 'tts'`。后果很具体：tts 关闭、breeze 启用时，
+不指定 resource 的调用会收到一个关于 **tts** 的 409，而一个能正常说话的引擎就在同一个
+端点后面。
+
+**能力不是 backend 名字**。三个资源都是 `backend: 'comfy'`，只有 breeze 能出声：
+
+| 资源 | 能力 | 依据 |
+|---|---|---|
+| `image` | `image` | comfy + 有 workflow |
+| `anima` | `image` | comfy + 有 workflow |
+| `breeze` | `speak` | comfy + 节点类含 `BreezeTTS2*`（**无 workflow，不能生图**） |
+| `tts` | `speak` | gsv 后端 |
+| `memory` | `search` | embed 后端 |
+
+所以按 `backend === 'gsv' || backend === 'comfy'` 过滤是错的——它会把 image、anima 也
+当成语音候选，然后在内部失败。判断依据必须是「它的工作流里有没有产出该输出的节点」，
+这和 `/prompt` 推断模型用的是同一份证据。
+
+**挑选规则**：
+
+```
+1. 显式指定的 resource 一律尊重（调用方知道网关不知道的事）
+2. 否则在「有能力」且「enabled」的资源里按 priority 升序取第一个
+   （与调度器抢占规则一致，避免网关有两种"最优"）
+3. 全都 disabled → 仍返回优先级最高的那个，让 DisabledError 报出它的名字
+   （拒绝理由必须真实，不能编一个默认值）
+4. 没有任何资源具备该能力 → 400，并列出各资源的能力
+```
+
+配置里可以显式声明 `capabilities: ["speak"]` 覆盖推断，用于本文件不认识的 backend。
+
+**响应带 `resource` 字段**，说明实际是谁服务的；`backend` 说明用的哪个引擎——两者
+不一定一一对应（资源 id 和引擎不是一回事）。
+
+`GET /api/status` 额外返回：
+
+```jsonc
+"routing": {
+  "speak":  { "resource": "breeze", "allDisabled": false },
+  "image":  { "resource": "image",  "allDisabled": false },
+  "search": { "resource": "memory", "allDisabled": false }
+}
+```
+
+这是**路由决策本身**，不是重新推导一遍，所以调用方看到的就是网关真会做的。
+
 **`POST /api/image`**
 
 ```jsonc
 {
   "prompt": "生成一张漫画风格的慵懒少女",
-  "resource": "image",              // 可选，默认 image
-  "workflow": "qwen21-image.json",   // 可选，默认取资源配置
+  "resource": "image",              // 可选；省略则按能力路由（可能选中 anima）
+  "workflow": "qwen21-image-api.json",   // 可选，默认取资源配置
   "override": { "5": { "seed": 123 } },  // 可选，按节点 id 覆盖
   "timeoutSec": 900
 }
@@ -457,7 +508,8 @@ elapsedSec 20.5 s   generateSec 7.1 s   loadSec 13.4 s   (客户端实测 20.6 s
 ```jsonc
 {
   "ok": true,
-  "workflow": "qwen21-image.json",
+  "resource": "image",                        // 实际服务的资源
+  "workflow": "qwen21-image-api.json",
   "promptId": "...",                          // 可用于向 ComfyUI 的 /history 核对该图实际内容
   "images": ["qwen21_00001_.png"],            // 裸名，ComfyUI 语义，兼容既有调用方
   "artifacts": [                               // 统一形态：带绝对路径
@@ -505,32 +557,37 @@ GET  /backends/tts/docs
 
 **`POST /api/speak`**
 
-GSV（`resource: "tts"`）**必须给 `refAudioPath`**（每次从参考音频克隆，没有默认值）
-与 `promptText`（参考音频的准确文字）：
+`resource` **可选**：省略时按能力路由（见 §6.3），响应里会说明实际用了谁。
+
+两种后端参数要求不同，所以省略 resource 时要注意：**GSV 必须给 `refAudioPath`**（每次从
+参考音频克隆，没有默认值）与 `promptText`；**Breeze 必须给 `mode` 及该模式的参数**。
+两者的必填项不一样，所以省略 resource 的调用应当传「两种都认」的字段，或者干脆显式指定。
+
+GSV：
 
 ```jsonc
-{ "resource": "tts", "text": "老大 我今天不想动",
+{ "text": "老大 我今天不想动",
   "refAudioPath": "E:\\B\\voices\\ref-1.wav",
   "promptText": "我之前听泰国歌曲好倒掉然后跟人家接" }
 ```
-响应：`{ok, backend:"gsv", file, bytes, elapsedSec}`
+响应：`{ok, resource, backend:"gsv", file, filename, bytes, artifacts, elapsedSec}`
 
-Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
+Breeze：
 
 ```jsonc
-{ "resource": "breeze", "mode": "design",
+{ "mode": "design",
   "text": "老大 我今天不想动", "instruction": "一位温柔自信的年轻女性…" }
 ```
 `clone` / `direction` 额外需要 `reference`（ComfyUI input 目录里的文件名）与
-`referenceText`。响应：`{ok, backend:"comfy", mode, promptId, audio:[...], elapsedSec}`
+`referenceText`。响应：`{ok, resource, backend:"comfy", mode, promptId, audio, artifacts, elapsedSec}`
 
 **`POST /api/search`**
 
 两种用法，二选一：
 
 ```jsonc
-{ "texts": ["文本一", "文本二"] }                         // → {ok, vectors, dim}
-{ "query": "查询", "candidates": ["候选1","候选2"], "topK": 5 }  // → {ok, ranked:[{index,score,text}]}
+{ "texts": ["文本一", "文本二"] }                         // → {ok, resource, vectors, dim}
+{ "query": "查询", "candidates": ["候选1","候选2"], "topK": 5 }  // → {ok, resource, ranked:[{index,score,text}]}
 ```
 
 ### 错误响应
@@ -624,6 +681,12 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 25 | 忙碌状态可见且会复位 | `test-busy`：生成中 `backendBusy=true`，完成后回到 `false` |
 | 26 | 三套工作流的 UI 格式可被 ComfyUI 打开 | `validate_ui_workflow.py` 对三份全部 `ok`（节点、widget 顺序、连线均与活服务 schema 一致） |
 | 27 | WebUI 拉起不再误报超时 | 控制请求超时 240 秒（原为 5 秒） |
+| 28 | 不指定 resource 时按能力路由 | `test-capability` 23/23：tts 关+breaze 开时 `/api/speak` 不指定 resource → **200 且 `resource=breeze`** |
+| 29 | 能力不是 backend 名字 | `test-capability`：三个 comfy 资源里只有 1 个能 speak；breeze 不被当作生图资源 |
+| 30 | 显式指定仍被尊重 | `test-capability`：指定 breeze 时 `resource=breeze`，不被路由到 tts |
+| 31 | 多个可用时按 priority 选 | `test-capability`：tts 与 breeze 都启用时 → `tts`（10 < 30） |
+| 32 | 全部禁用时拒绝理由真实 | `test-capability`：409 且 `resource` 是真实候选（tts），不是编造的默认值 |
+| 33 | 能力不符时错误说清楚 | `test-capability`：让 breeze 生图 → `400 resource "breeze" cannot image; it can: speak` |
 
 复跑：
 
@@ -637,6 +700,7 @@ node src\test-prompt-delivery.js # prompt 真的进了模型（约 1 分钟）
 node src\test-resources.js       # 共用端口 / 独立控制 / 代理（约 1 分钟）
 node src\test-comfyapi.js        # ComfyUI 形状接口 + 模型推断（约 2 分钟）
 node src\test-busy.js            # 生成期间不被停用（约 2 分钟）
+node src\test-capability.js      # 能力路由（约 3 分钟，会真的合成一次语音）
 node src\test-crash.js           # 并发压力（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
@@ -923,6 +987,48 @@ Breeze 是特殊情况：它的图由 `backends/breeze.js` 代码现拼，原本
    Breeze 的大部分生成参数在 `optional` 里，于是每个节点都"少算"。
 
 另外 `CLIPLoader` 的 `device` 是 optional 但画布仍存值，widget 表里必须带上。
+
+### 第九轮：`/api/speak` 的默认资源写死
+
+**报告**：`/api/speak` 用 `body.resource ?? 'tts'`。tts 关闭、breeze 启用时，
+不指定 resource 的调用会收到一个关于 **tts** 的 409，而能说话的引擎就在同一端点后面。
+
+**同一个问题存在于三个端点**：`/api/image ?? 'image'`、`/api/search ?? 'memory'`。
+都是「调用方问的是能力，网关答的是资源 id」。
+
+**修法**：能力路由（§6.3）。要点是**能力不等于 backend 名字**——用户建议的
+`backend === 'gsv' || backend === 'comfy'` 会把 image/anima 也算成语音候选，
+然后在内部失败。真正的依据是「工作流里有没有产出该输出的节点类」，
+与 `/prompt` 推断模型同一份证据。
+
+#### 实现时抓到的两个问题
+
+**① 能力推断第一版把 breeze 算成能生图**。因为 `backend === 'comfy'` 就加 `image`，
+但 breeze **没有 workflow**（它的图是代码拼的），`/api/image` 路由到它只会报
+"no default workflow"。修法：`image` 能力要求**有 workflow**。
+路由实测从 `image -> breeze` 纠正为 `image -> image`。
+
+**② 我给 `/api/status` 引入了每 2 秒重复读文件**。能力推断调
+`availableClasses()` → `buildWorkflow()` → **每次深拷贝整个工作流 JSON**。
+而 `/api/status` 会为每个资源 × 每个能力算一遍，WebUI 每 2 秒轮询一次。
+实测 `/api/status` 从 **122ms 降到 1–2ms**（加了按工作流名缓存之后）。
+这是我自己加的负载，不是既有问题——但它是本轮唯一可能解释测试中那次进程消失的线索
+（见下）。
+
+#### 一次未定位的进程消失
+
+跑回归途中网关死了一次：`cleanExit: false`、心跳停在 `GET /api/status`、
+**stderr 为空且无 uncaughtException 记录**、父 `cmd.exe` 仍存活。
+
+按已有诊断，这个组合排除了 JS 异常，指向「被外部终止或原生崩溃」。但**这次不是父进程
+连坐**（父 cmd.exe 活着，node 是它的前台子进程），所以与之前那次的结论不同。
+
+重启后 8 个测试套件全绿、网关稳定。**我没有定位到原因，也没有为了"看起来修好了"而
+改动任何东西**。上面那个 status 负载是唯一可疑的改动，已优化；但如果再次发生，
+现有证据不足以断言是它。
+
+下一步该做的（如果复发）：给 heartbeat 增加 RSS 与句柄数，让"内存/句柄耗尽"这类
+不可见原因留下数字。
 
 ### 第七轮：`elapsedSec` 恒为 null
 

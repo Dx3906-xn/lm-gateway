@@ -26,6 +26,7 @@ import * as breeze from './backends/breeze.js';
 import * as gsv from './backends/gsv.js';
 import * as embed from './backends/embed.js';
 import * as comfyapi from './comfyapi.js';
+import { capabilitiesOf, selectForCapability, capabilityMap } from './capabilities.js';
 import * as ports from './ports.js';
 import * as heartbeat from './heartbeat.js';
 import { log } from './log.js';
@@ -249,6 +250,14 @@ async function handleStatus() {
     }
   }));
 
+  // What each resource can do, so a caller can see the same answer the router uses. Without
+  // it, "why did /api/speak go to breeze" is only answerable by reading the config and
+  // knowing which node prefixes count as voice.
+  for (const entry of resources) {
+    const resource = config.resources[entry.id];
+    entry.capabilities = resource ? [...capabilitiesOf(resource)] : [];
+  }
+
   return {
     master: config.master?.enabled ?? true,
     gateway: { port: config.gateway.port, uptimeSec: Math.round(process.uptime()) },
@@ -258,6 +267,14 @@ async function handleStatus() {
       usableMiB: gpu.ok ? usableMiB(gpu, config.gpu?.headroomMiB ?? 0) : 0,
     },
     resources,
+    // Which resource each capability would route to right now, and null when nothing
+    // enabled can serve it. This is the routing decision itself, not a re-derivation of it.
+    routing: Object.fromEntries(
+      ['speak', 'image', 'search'].map((capability) => {
+        const choice = selectForCapability(capability);
+        return [capability, { resource: choice.id, allDisabled: choice.allDisabled === true }];
+      }),
+    ),
     groups: registry.groupSnapshot(),
     queue: scheduler.queueSnapshot(),
   };
@@ -411,14 +428,67 @@ function handleHealth() {
   };
 }
 
+/**
+ * Decide which resource serves a request.
+ *
+ * Naming one is always honoured - the caller knows something the gateway does not. Naming
+ * none means "whoever can do this", which is the question the endpoint actually answers:
+ * `/api/speak` is a request to say something, not a request to use GPT-SoVITS. The old code
+ * returned a hardcoded id here, so with that resource switched off a caller got a 409 about
+ * a resource it never asked for while a working voice engine sat behind the same URL.
+ *
+ * The capability is what decides, not the backend name - see capabilities.js for why
+ * filtering on `backend === 'comfy'` would offer the picture models as voice candidates.
+ *
+ * @param {string|undefined} requested - `body.resource`, when given.
+ * @param {string} capability - "speak", "image" or "search".
+ * @returns {string} the resource id to use.
+ */
+function resolveResource(requested, capability) {
+  if (typeof requested === 'string' && requested.length > 0) return requested;
+
+  const choice = selectForCapability(capability);
+  if (choice.id === null) {
+    // Nothing can do it at all: a configuration problem, and saying so beats a 409 about
+    // some default that was never asked for.
+    throw new ValidationError(choice.reason ?? `no resource can ${capability}`);
+  }
+
+  if (choice.allDisabled === true) {
+    // Capable resources exist but every one is switched off. Returning the best of them
+    // lets the existing DisabledError name it, so the refusal keeps its real reason.
+    log.warn(`no enabled resource can ${capability}; trying "${choice.id}" so the refusal names it`);
+  }
+
+  return choice.id;
+}
+
+/**
+ * Check a resource can do what is about to be asked of it, and say what it can do instead.
+ *
+ * The old checks were per-backend (`if backend !== 'gsv'`), which produced "resource image
+ * is not an embedding backend" - true, but not the sentence a caller needs when it simply
+ * omitted `resource` and the router handed back the wrong thing.
+ *
+ * @param {string} id - the chosen resource.
+ * @param {object} resource - its config entry.
+ * @param {string} capability - what was asked for.
+ */
+function requireCapability(id, resource, capability) {
+  if (capabilitiesOf(resource).has(capability)) return;
+  const has = [...capabilitiesOf(resource)];
+  throw new ValidationError(
+    `resource "${id}" cannot ${capability}` +
+    (has.length > 0 ? `; it can: ${has.join(', ')}` : '; it declares no capabilities'),
+  );
+}
+
 async function handleImage(body) {
-  const id = body.resource ?? 'image';
+  const id = resolveResource(body.resource, 'image');
   const started = Date.now();
 
   return scheduler.run(id, async (resource) => {
-    if (resource.backend !== 'comfy') {
-      throw new ValidationError(`resource "${id}" is not a ComfyUI backend; cannot generate images`);
-    }
+    requireCapability(id, resource, 'image');
 
     const workflowName = body.workflow ?? resource.workflow;
     if (!workflowName) {
@@ -447,6 +517,9 @@ async function handleImage(body) {
 
     return {
       ok: true,
+      // Which resource served this. A caller that omitted `resource` can see where its
+      // request went, and a caller that named one can confirm it was honoured.
+      resource: id,
       workflow: workflowName,
       promptId: result.promptId,
       // ComfyUI's own file list, kept for callers that already speak it.
@@ -461,10 +534,14 @@ async function handleImage(body) {
 }
 
 async function handleSpeak(body) {
-  const id = body.resource ?? 'tts';
+  // No hardcoded default: whoever can speak serves it. With GPT-SoVITS off and Breeze on,
+  // omitting `resource` now works instead of returning a 409 about tts.
+  const id = resolveResource(body.resource, 'speak');
   const started = Date.now();
 
   return scheduler.run(id, async (resource) => {
+    requireCapability(id, resource, 'speak');
+
     if (resource.backend === 'gsv') {
       const spoke = await gsv.speak(baseUrl(resource), body, body.timeoutSec ?? 300);
 
@@ -479,6 +556,10 @@ async function handleSpeak(body) {
 
       return {
         ok: true,
+        // Which resource actually served this, so a caller that omitted `resource` can see
+        // where its request went. `backend` says which engine; `resource` says which entry
+        // in the config, and those are not always one to one.
+        resource: id,
         backend: 'gsv',
         file,
         filename: name,
@@ -495,6 +576,7 @@ async function handleSpeak(body) {
       const dir = outputDirFor(getConfig(), resource);
       return {
         ok: true,
+        resource: id,
         backend: 'comfy',
         mode: body.mode ?? 'design',
         promptId: result.promptId,
@@ -505,18 +587,21 @@ async function handleSpeak(body) {
       };
     }
 
-    throw new ValidationError(`resource "${id}" cannot speak (backend ${resource.backend})`);
+    // Reached only when the config claims a capability its backend does not implement.
+    // requireCapability passed, so the declaration said "speak"; the backend disagrees.
+    throw new ValidationError(
+      `resource "${id}" declares "speak" but its backend "${resource.backend}" has no ` +
+      'speech implementation; remove the capability or fix the backend',
+    );
   });
 }
 
 async function handleSearch(body) {
-  const id = body.resource ?? 'memory';
+  const id = resolveResource(body.resource, 'search');
   const started = Date.now();
 
   return scheduler.run(id, async (resource) => {
-    if (resource.backend !== 'embed') {
-      throw new ValidationError(`resource "${id}" is not an embedding backend`);
-    }
+    requireCapability(id, resource, 'search');
     const base = baseUrl(resource);
     // A deadline on every call out. Without one, a service that dies mid-request
     // leaves this handler waiting on a socket that will never answer - the request
@@ -525,7 +610,12 @@ async function handleSearch(body) {
 
     if (Array.isArray(body.texts)) {
       const result = await embed.embed(base, body.texts, timeoutSec);
-      return { ok: true, ...result, elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)) };
+      return {
+        ok: true,
+        resource: id,
+        ...result,
+        elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
+      };
     }
 
     if (body.query) {
@@ -539,7 +629,12 @@ async function handleSearch(body) {
         .map((score, index) => ({ index, score, text: body.candidates[index] }))
         .sort((a, b) => b.score - a.score)
         .slice(0, body.topK ?? result.scores.length);
-      return { ok: true, ranked, elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)) };
+      return {
+        ok: true,
+        resource: id,
+        ranked,
+        elapsedSec: Number(((Date.now() - started) / 1000).toFixed(1)),
+      };
     }
 
     throw new ValidationError('search requires either "texts" (embed) or "query" plus "candidates" (rank)');
@@ -779,7 +874,13 @@ async function dispatch(request, response) {
     // over HTTP means a caller can read it without knowing the on-disk layout.
     'GET /api/heartbeat': () => heartbeat.current(),
     'GET /api/workflows': () => ({ workflows: comfy.listWorkflows() }),
-    'POST /api/workflows/reload': () => ({ workflows: comfy.listWorkflows(true).keys?.() ?? [] }),
+    // Reloading workflows must also drop the class cache, or capability routing keeps
+    // believing a resource can run nodes its file no longer contains.
+    'POST /api/workflows/reload': () => {
+      const names = comfy.listWorkflows(true);
+      comfyapi.clearClassCache();
+      return { workflows: names };
+    },
 
     'POST /api/master': (body) => handleMaster(body),
     // Graceful stop, used by scripts/stop-gateway.ps1.
@@ -811,7 +912,12 @@ async function dispatch(request, response) {
     // already use them, and that is not a reason a caller should have to rewrite anything.
     'POST /prompt': (body) => comfyapi.submitPrompt(body),
     'GET /object_info': () => comfyapi.objectInfo(),
-    'GET /models': () => comfyapi.models(),
+    // Discovery includes what each resource can do, because "which of these would answer
+    // /api/speak" is the question this endpoint exists to answer.
+    'GET /models': () => ({
+      ...comfyapi.models(),
+      capabilities: capabilityMap(),
+    }),
     'GET /queue': () => comfyapi.queue(),
     'POST /interrupt': () => comfyapi.interrupt(),
   };

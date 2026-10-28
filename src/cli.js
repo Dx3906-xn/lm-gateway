@@ -139,6 +139,9 @@ async function commandSmoke() {
     // --- 1. master off refuses, and does not spawn ---------------------------
     console.log('1. master switch off');
     await call('POST', '/api/master', { enabled: false });
+    // Deliberately without `resource`: the master switch must refuse everything, so no
+    // routing decision may rescue the call. This is the one case where omitting the name is
+    // the more demanding test.
     const refused = await call('POST', '/api/image', { prompt: 'smoke test' });
 
     check(results, 'master off -> 409', refused.status === 409,
@@ -153,7 +156,12 @@ async function commandSmoke() {
     await call('POST', '/api/master', { enabled: true });
     await call('POST', '/api/resources/image', { enabled: false });
 
-    const refused2 = await call('POST', '/api/image', { prompt: 'smoke test' });
+    // `resource` is named explicitly on purpose. Omitting it means "whoever can draw", and
+    // `anima` is enabled - so the request would succeed by routing there. That is correct
+    // behaviour and the point of capability routing, but it is not what this step tests:
+    // the claim here is that a *named* switched-off resource refuses. Passing the name keeps
+    // the two behaviours separate instead of letting one hide the other.
+    const refused2 = await call('POST', '/api/image', { resource: 'image', prompt: 'smoke test' });
     check(results, 'resource off -> 409', refused2.status === 409, `got ${refused2.status}`);
     check(results, 'resource off -> reason "resource"', refused2.body?.reason === 'resource',
       `reason=${refused2.body?.reason}`);
@@ -164,6 +172,21 @@ async function commandSmoke() {
       `ok=${manual.body?.ok}`);
     check(results, 'resource off -> port STILL closed after manual start',
       !(await portOpen(port)), `port ${port}`);
+
+    // The other half of the same story, asserted rather than assumed: omitting the name
+    // must find the enabled resource instead of failing on the disabled one. This is the
+    // behaviour that was reported missing for /api/speak.
+    //
+    // Checked last on purpose. It succeeds by starting `anima`, which shares this port, so
+    // running it earlier would leave 8188 occupied and make the "port still closed"
+    // assertions above fail for an unrelated reason.
+    const routed = await call('POST', '/api/image', { prompt: 'smoke test' }, 30);
+    check(results, 'omitting resource routes to an enabled one instead of 409',
+      routed.status !== 409, `status=${routed.status} resource=${routed.body?.resource}`);
+    if (routed.body?.resource) {
+      // Put the machine back: whoever served it is now resident because of this check.
+      await call('POST', `/api/resources/${routed.body.resource}/stop`, undefined, 90);
+    }
 
     // --- 3. state reports disabled ------------------------------------------
     console.log('3. status reflects the switch');
