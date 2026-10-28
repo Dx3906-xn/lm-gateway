@@ -22,6 +22,7 @@ import { getConfig } from './config.js';
 import { readGpu, usableMiB } from './gpu.js';
 import * as lifecycle from './lifecycle.js';
 import * as registry from './registry.js';
+import * as ports from './ports.js';
 import { log } from './log.js';
 
 /**
@@ -202,7 +203,7 @@ async function ensureRunning(id) {
   // Already up but unrecorded (started by hand, or before this process existed).
   // fresh: whether to launch is a decision, so a cached probe must not answer it - a
   // stale "no" would start a second copy of something already running.
-  if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
+  if (await lifecycle.isReachable(ports.readyUrl(resource), resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
     registry.markExternal(id);
     state.state = 'ready';
     return;

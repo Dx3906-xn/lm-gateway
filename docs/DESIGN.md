@@ -72,31 +72,55 @@ E:\B\lm-gateway\
 
 ## 3. 端口分配
 
-**已占用，不得使用**：1234 LM Studio、3001 QQ、3080 DSH GUI、3081 DSH node、
-8188 ComfyUI、9820 embed-server、9880 GPT-SoVITS。
+**外部只需要一个端口：8790。** 后端模型端口由网关**动态分配**，不写死在配置或脚本里。
 
 | 用途 | 端口 | 说明 |
 |---|---|---|
-| **网关 HTTP（API + WebUI）** | **8790** | **唯一对外入口**，含 `/backends/<id>/…` 代理 |
-| ComfyUI（image / anima / breeze 三者互斥） | 8188 | 由网关代管；**三个资源共用，同一时刻只有一个在跑** |
-| GPT-SoVITS | 9880 | 由网关代管 |
-| embed-server 记忆检索 | 9820 | 由网关代管 |
+| **网关 HTTP（API + WebUI + 代理）** | **8790** | **唯一对外入口** |
+| ComfyUI（image / anima / breeze 同组共用） | 网关分配 | 默认从 `backendPortBase`(8188) 起扫，被占则顺延 |
+| GPT-SoVITS（tts） | 网关分配 | 单独一组 |
+| embed-server（memory） | 网关分配 | 单独一组 |
 
-**调用方只认 8790。** 后端端口是内部实现细节，但需要通过代理访问：
+**已占用、不得使用**（网关自动避开）：1234 LM Studio、3001 QQ、3080/3081 DSH、8790 自身。
+
+### 分配规则（`src/ports.js`）
 
 ```
-网关自身接口     http://127.0.0.1:8790/api/...
-WebUI            http://127.0.0.1:8790/
-后端原生接口     http://127.0.0.1:8790/backends/<id>/<path>
+1. 配置里 port: 0              → 网关挑选
+2. 同一 exclusiveGroup 的成员   → 强制共用一个端口
+3. 不同组                      → 各自动找空闲端口（base 起，最多扫 portScanSpan 个）
+4. 已分配的资源在进程内保持不变  → 重启服务不会换端口
 ```
 
-`<id>` 是 `image` / `anima` / `breeze` / `tts` / `memory`。例如原本要直连 8188 的
-`GET /system_stats`，现在是 `GET /backends/anima/system_stats`。
+**为什么同组必须共用一个端口**：`image`/`anima`/`breeze` 是同一个 ComfyUI 进程的三套配置。
+给它们各分一个端口会让"任一时刻只有一个在跑"失效——三个不同端口看起来就是三个独立服务。
+共用端口是它们关系的**事实**，不是优化。
 
-**为什么 8188 有三个资源不是配置错误**：一个端口只能有一个监听者，所以
-`image`/`anima`/`breeze` 声明在同一 `exclusiveGroup` 里**互斥**——任一时刻只有一个能占用它。
-它们不是三个服务，而是同一个 ComfyUI 进程的三套启动参数（生图开 DynamicVRAM，
-Breeze 必须关，Anima 用另一张工作流）。
+**端口怎么进服务**：启动命令里用 `{port}` 占位，lifecycle 在 spawn 前替换。
+
+```jsonc
+// 脚本型（接受端口参数）
+"start": { "script": "start_comfy.ps1", "args": ["-Port", "{port}", "-ReserveVram", "0"] }
+
+// 环境变量型（embed-server 读 EMBED_PORT）
+"start": { "cmd": "E:\\B\\venv\\Scripts\\python.exe", "args": ["..."],
+           "env": { "EMBED_PORT": "{port}" }, "detached": true }
+```
+
+就绪探测用 `ready.path` 而不是完整 URL——主机固定本机，端口要运行时才知道：
+
+```jsonc
+"ready": { "path": "/system_stats", "timeoutSec": 180 }
+```
+
+### 只有 8790 需要暴露
+
+```
+网关自身接口      http://127.0.0.1:8790/api/...
+ComfyUI 形状接口  http://127.0.0.1:8790/prompt、/history、/object_info …
+WebUI             http://127.0.0.1:8790/
+后端原生接口      http://127.0.0.1:8790/backends/<id>/<path>（逃生用）
+```
 
 ---
 
@@ -274,6 +298,45 @@ Anima 那个 `4000` 是估值不是实测——它和 `image` 同组互斥，任
 ## 6. HTTP API
 
 Base：`http://127.0.0.1:8790`
+
+### 6.0 ComfyUI 形状的接口（**对外主接口**）
+
+调用方按 **ComfyUI 的协议**用，不知道下面是哪个模型、哪个端口。模型由网关从图里的节点类
+**推断**，需要时自动拉起。实现见 `src/comfyapi.js`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | **`/prompt`** | 提交 API 格式图，立刻返回 `{prompt_id, number, node_errors}`；后台执行 |
+| `GET` | **`/history/<prompt_id>`** | 轮询结果，ComfyUI 形状的 `outputs` |
+| `GET` | **`/history`** | 全部执行记录 |
+| `GET` | **`/queue`** | `{queue_running, queue_pending}` |
+| `POST` | **`/interrupt`** | 取消排队中的工作（已在采样的图需走后端 `/interrupt`） |
+| `GET` | **`/object_info`** | 可通过本网关提交的节点类（**只列配置工作流实际用的**，不冒充全量） |
+| `GET` | **`/object_info/<class>`** | 单个节点类 |
+| `GET` | **`/models`** | 可用资源 + 网关分配到的端口（调试用，非 ComfyUI 标准） |
+
+**模型是怎么选出来的**：按节点类匹配。图里出现的每个 `class_type` 都必须存在于某资源的
+工作流中（或其在 `classes` 里声明的类），否则直接 400 拒绝——**在模型加载之前**，而不是
+让它加载 6 GB 之后再报"未知节点"。
+
+```jsonc
+// 提交一张自己写的图（节点 id 与仓库里的工作流不同也没关系）
+POST /prompt
+{ "prompt": { "1": {"class_type":"UNETLoader", ...}, ... } }
+→ { "prompt_id": "a389bdaa-...", "number": 1, "node_errors": {} }
+
+// 轮询
+GET /history/a389bdaa-...
+→ { "a389bdaa-...": { "status": {...}, "outputs": { "anima": { "images": [...] } },
+                      "resource": "anima", "artifacts": [...] } }
+```
+
+**补全缺失的保存节点**：调用方给的图如果自带 `Save*` 节点，原样提交；如果没有（多数客户端
+只写"有意义的节点"），网关从该资源工作流里取出它的保存节点接上，这样输出才找得到。
+
+**`classes` 字段**：为代码生成图的资源声明自己能跑的节点类。Breeze 的图是
+`backends/breeze.js` 每次请求现拼的，没有 JSON 可introspect，所以配置里显式列出——
+否则网关会以为没有任何模型能跑 Breeze 图。
 
 ### 状态与控制
 
@@ -458,6 +521,7 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | `500` | 其他 | `{ok:false, error}` |
 
 **未知资源 id 返回 500**（`scheduler.run` 抛出），不是 404 —— 客户端不应假定 404。
+`/prompt` 的"没有模型能跑这张图"是 **400**（调用方的图不对，不是服务故障）。
 
 ---
 
@@ -525,6 +589,12 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 13 | 只暴露 8790 也能访问后端 | `test-resources`：`/backends/anima/system_stats` 200，`object_info` 嵌套路径 200 |
 | 14 | 代理不是后门 | `test-resources`：关闭时 409 + `reason:"resource"`、未知资源 404 |
 | 15 | 代理算"在用" | `test-resources`：代理访问后 keepAlive 重置为 180s |
+| 16 | 端口由网关分配，不写死 | `test-comfyapi`：`/models` 里每个资源都有网关分配的端口；配置 `port: 0` |
+| 17 | 同组资源共用一个端口 | 启动日志 `ports allocated: image=8188, anima=8188, breeze=8188` |
+| 18 | 对外只有 ComfyUI 形状的接口 | `test-comfyapi` 17/17：全程只访问 8790 的 `/prompt`、`/history`、`/object_info` |
+| 19 | 手写图能被自动路由并出图 | `test-comfyapi`：自造节点 id 的图 → `resource=anima`，产出 `dafiyu_00022_.png` |
+| 20 | 模型按节点类推断，不会误路由 | `test-comfyapi`：Breeze 图 → `resource=breeze`，不是 image |
+| 21 | 跑不了的图在加载前拒绝 | `test-comfyapi`：未知节点 → **400**，不是让模型先加载再报错 |
 
 复跑：
 
@@ -536,6 +606,7 @@ node src\test-start.js memory    # 冷启动，常驻型（约 30 秒）
 node src\test-memory.js          # 记忆检索端到端（约 30 秒）
 node src\test-prompt-delivery.js # prompt 真的进了模型（约 1 分钟）
 node src\test-resources.js       # 共用端口 / 独立控制 / 代理（约 1 分钟）
+node src\test-comfyapi.js        # ComfyUI 形状接口 + 模型推断（约 2 分钟）
 node src\test-crash.js           # 并发压力（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
@@ -551,7 +622,11 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
 - **可用显存约 6600–6700 MiB**（8188 总量 − 桌面 1300–2000 − headroom 128）
 - **任意两个大模型不能共存**：`5156 + 1200 > 6600`
 - **DynamicVRAM 冲突**：生图要**开**（137s vs 638s），Breeze 要**关**（40s vs 250s）
-  → 两者共用 8188，必须互斥且用不同启动参数
+  → 两者共用同一端口，必须互斥且用不同启动参数
+- **后端端口是运行时才定的**：日志里 `ports allocated:` 才是本次的真实分配；
+  文档里出现的 8188 只是默认起点（`backendPortBase`），不是保证
+- **`{port}` 占位只在 `start`/`stop` 生效**：`ready.path` 自动拼端口，不要手写完整 URL
+- **`/prompt` 的模型推断靠 `class_type`**：自造节点类的图会被 400 拒绝——这是设计，不是缺陷
 - **冷启动**：ComfyUI 约 17–70 秒（视缓存）；GPT-SoVITS 约 70 秒
 - **`cuda_graphs` 模式会崩 ComfyUI**，Breeze 一律用 `eager`（代码内固定）
 - **启动命令的输出必须写文件不能走管道**：`Start-Process` 的子进程会继承管道，
@@ -696,3 +771,42 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
    就是占用该端口的那个**。判断"到底哪个加载着"必须用 `active`
 
 这不只是显示问题——一个会同时报告三个资源在运行的面板，会让人不相信它的其他任何输出。
+
+### 第六轮：端口动态分配 + ComfyUI 形状的对外接口
+
+**要求**：不写死硬编码；网关智能调配；只有一个端口给外部；模型不设独立端口；
+对外统一包装成 ComfyUI 的 API。
+
+| 要求 | 实现 |
+|---|---|
+| 不写死端口 | 配置里 `port: 0`，`src/ports.js` 在启动前**绑定探测**找空闲端口。脚本用 `{port}` 占位，lifecycle 在 spawn 前替换；embed-server 走 `EMBED_PORT` 环境变量 |
+| 智能调配 | 同 `exclusiveGroup` **强制同端口**（它们本来就是一个进程）；不同组各挑空闲端口；已分配的在进程内保持不变，重启服务不换号 |
+| 只有一个端口 | 8790。后端端口不出现在任何对外契约里 |
+| 统一的 ComfyUI API | `src/comfyapi.js`：`/prompt`、`/history`、`/queue`、`/interrupt`、`/object_info` + `/models` |
+| 模型智能选择 | 按**节点类**匹配：图里每个 `class_type` 必须在某资源的工作流（或 `classes` 声明）里存在，否则 **400 在加载前拒绝** |
+
+#### 三个实现时踩到的坑（都由测试抓到）
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| `POST /prompt` 执行报 `ports is not defined` | `scheduler.js` 里改用了 `ports.readyUrl` 但没 import | 补 import。**这个错误只在真实执行 /prompt 时暴露**，单测逻辑不触发 |
+| `/models`、`/object_info` 返回 `not found` | 它们是 ComfyUI 的根路径，不在 `/api/` 下，被静态文件分支吃掉 | 显式白名单 `COMFY_PATHS`。不用"不是文件就走路由"，否则拼错路径会变成静态 404，看起来像路由没写 |
+| Breeze 图被拒绝 "no configured model can run this" | Breeze 的图是代码现拼的，没有 JSON 可 introspect | 新增 `classes` 字段让这类资源声明自己能跑的节点类 |
+
+#### 模型推断的判定
+
+```js
+// 硬过滤：图里每个 class_type 都必须在该资源可用类里
+const missing = [...wanted].filter((t) => !available.has(t));
+if (missing.length > 0) continue;
+// 打分：可用类里"用不上"的越少越贴合
+score = -unused;
+```
+
+先过滤再打分，因为**跑一张含未知节点的图，代价是先加载 6 GB 模型再报错**。宁可提前 400。
+
+#### 同组必须同端口
+
+`image`/`anima`/`breeze` 是同一个 ComfyUI 进程的三套配置。给它们各分一个端口会让
+"任一时刻只有一个在跑"这个保证失效——三个不同端口看起来就是三个独立服务，而它们不是。
+所以 `allocatePorts` 先按组分配，组内成员共享同一个号。

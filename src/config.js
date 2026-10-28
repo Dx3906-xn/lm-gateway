@@ -71,7 +71,7 @@ function validateResource(id, resource) {
     problems.push(`resource "${id}": keepAliveSec below -1 has no meaning`);
   }
   if (!Number.isFinite(resource.port)) {
-    problems.push(`resource "${id}": port must be a number`);
+    problems.push(`resource "${id}": port must be a number (0 asks the gateway to allocate one)`);
   }
 
   const hasStart = resource.start?.script || resource.start?.cmd;
@@ -82,8 +82,12 @@ function validateResource(id, resource) {
   if (!hasStop) {
     problems.push(`resource "${id}": stop needs "script", "cmd" or "url"`);
   }
-  if (!resource.ready?.url) {
-    problems.push(`resource "${id}": ready.url is required (used to wait for startup)`);
+  // Either form is accepted: `path` is the one that works with an allocated port, `url` is
+  // kept for a resource pinned to a known address.
+  if (!resource.ready?.url && !resource.ready?.path) {
+    problems.push(
+      `resource "${id}": ready needs "path" (used with the allocated port) or a full "url"`,
+    );
   }
 
   return problems;
@@ -118,10 +122,13 @@ export function validateConfig(document) {
   // Same port reached by two resources is legal only when they are in one
   // exclusive group - that is exactly the image/breeze case, where both talk to
   // ComfyUI on 8188 but with mutually exclusive startup flags.
+  // Checked only when ports are pinned. With dynamic allocation every resource starts at
+// port 0, which is not a real port - the gateway hands each one a distinct number later
+// (see ports.js), so there is nothing to collide here and no group constraint to infer.
   const byPort = new Map();
   for (const [id, resource] of Object.entries(document.resources)) {
     const key = resource?.port;
-    if (!Number.isFinite(key)) continue;
+    if (!Number.isFinite(key) || key === 0) continue;
     if (!byPort.has(key)) byPort.set(key, []);
     byPort.get(key).push(resource);
   }

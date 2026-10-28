@@ -25,6 +25,8 @@ import * as comfy from './backends/comfy.js';
 import * as breeze from './backends/breeze.js';
 import * as gsv from './backends/gsv.js';
 import * as embed from './backends/embed.js';
+import * as comfyapi from './comfyapi.js';
+import * as ports from './ports.js';
 import * as heartbeat from './heartbeat.js';
 import { log } from './log.js';
 
@@ -111,13 +113,24 @@ function sendError(response, error) {
     return sendJson(response, 400, { ok: false, error: message, reason: 'bad-request' });
   }
 
+  // Handlers may declare their own status (comfyapi rejects an unrunnable graph with 400,
+  // which is a caller mistake, not a server fault). Honouring it keeps "you sent something
+  // I cannot run" distinguishable from "I broke".
+  if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 600) {
+    return sendJson(response, error.status, {
+      ok: false,
+      error: message,
+      ...(error.reason ? { reason: error.reason } : {}),
+    });
+  }
+
   log.error('request failed', message.slice(0, 300));
   return sendJson(response, 500, { ok: false, error: message });
 }
 
-/** Which backend base URL a resource talks to. */
+/** Which backend base URL a resource talks to. Port comes from the allocator. */
 function baseUrl(resource) {
-  return `http://127.0.0.1:${resource.port}`;
+  return ports.backendUrl(resource);
 }
 
 // --------------------------------------------------------------------------- //
@@ -154,7 +167,7 @@ async function handleStatus() {
     if (group) {
       if (!probedGroups.has(group)) {
         probedGroups.set(group, await lifecycle.isReachable(
-          resource.ready.url, resource.ready?.method ?? 'GET', 3_000,
+          ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000,
         ));
       }
       if (!probedGroups.get(group)) return;
@@ -169,7 +182,7 @@ async function handleStatus() {
       return;
     }
 
-    if (await lifecycle.isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 3_000)) {
+    if (await lifecycle.isReachable(ports.readyUrl(resource), resource.ready?.method ?? 'GET', 3_000)) {
       registry.markExternal(id);
       state.state = 'ready';
     }
@@ -198,7 +211,7 @@ async function handleStatus() {
     if (resource?.backend !== 'embed') return;
 
     if (entry.state === 'ready' || entry.state === 'busy') {
-      const info = await embed.health(`http://127.0.0.1:${resource.port}`);
+      const info = await embed.health(ports.backendUrl(resource));
       entry.info = info;
       // Promoted to the top level so a caller does not have to know which backend
       // produced it.
@@ -595,7 +608,7 @@ async function proxyToBackend(request, response, resourceId, rest) {
     });
   }
 
-  const target = `http://127.0.0.1:${resource.port}/${rest}`;
+  const target = `${ports.backendUrl(resource)}/${rest}`;
   heartbeat.noteActivity(`PROXY ${request.method} ${resourceId}/${rest.split('?')[0]}`);
 
   // Buffer the request body: these are JSON control payloads, not uploads, and a streamed
@@ -657,10 +670,16 @@ async function dispatch(request, response) {
     return proxyToBackend(request, response, decodeURIComponent(proxyMatch[1]), rest);
   }
 
+  // ComfyUI's own paths live at the root, not under `/api/`, and they are now the primary
+  // interface - so the static-file branch has to let them through. Listed explicitly rather
+  // than "anything that is not a file", because silently swallowing a typo as a 404 from the
+  // static handler produced "not found" for `/models` the first time this was wired up.
+  const COMFY_PATHS = /^\/(prompt|history|queue|interrupt|object_info|models|view|embeddings)(\/|$)/;
+
   // `/health` sits outside the `/api/` prefix on purpose - it is the path every
-// supervisor already tries - so it has to be let past the static-file branch rather
-// than served as a missing file.
-  if (!path.startsWith('/api/') && path !== '/health') {
+  // supervisor already tries - so it has to be let past the static-file branch rather
+  // than served as a missing file.
+  if (!path.startsWith('/api/') && path !== '/health' && !COMFY_PATHS.test(path)) {
     if (method !== 'GET') {
       response.writeHead(405);
       response.end('method not allowed');
@@ -718,7 +737,37 @@ async function dispatch(request, response) {
     'POST /api/image': (body) => handleImage(body),
     'POST /api/speak': (body) => handleSpeak(body),
     'POST /api/search': (body) => handleSearch(body),
+
+    // --- ComfyUI's shape, which is now the primary surface ----------------
+    //
+    // A caller submits a graph and polls for the result, exactly as it would against
+    // ComfyUI itself; the gateway reads the graph, works out which model can run it,
+    // starts that model, and answers in ComfyUI's own format. See comfyapi.js.
+    //
+    // The `/api/*` routes above stay as thin per-model conveniences. They are no longer
+    // the recommended interface, but removing them would break the two clients that
+    // already use them, and that is not a reason a caller should have to rewrite anything.
+    'POST /prompt': (body) => comfyapi.submitPrompt(body),
+    'GET /object_info': () => comfyapi.objectInfo(),
+    'GET /models': () => comfyapi.models(),
+    'GET /queue': () => comfyapi.queue(),
+    'POST /interrupt': () => comfyapi.interrupt(),
   };
+
+  // ComfyUI's lookup paths take an argument, so they are matched rather than tabulated.
+  const historyMatch = path.match(/^\/history(?:\/([^/]+))?$/);
+  if (historyMatch && method === 'GET') {
+    return sendJson(response, 200, comfyapi.history(historyMatch[1]));
+  }
+  const objectInfoMatch = path.match(/^\/object_info\/([^/]+)$/);
+  if (objectInfoMatch && method === 'GET') {
+    const all = comfyapi.objectInfo();
+    const wanted = decodeURIComponent(objectInfoMatch[1]);
+    if (!all[wanted]) {
+      return sendJson(response, 404, { ok: false, error: `no node class "${wanted}" available here` });
+    }
+    return sendJson(response, 200, { [wanted]: all[wanted] });
+  }
 
   const handler = routes[`${method} ${path}`];
   if (!handler) {

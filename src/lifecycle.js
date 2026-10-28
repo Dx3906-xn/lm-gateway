@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { log } from './log.js';
 import { getConfig, paths } from './config.js';
 import * as registry from './registry.js';
+import { readyUrl, applyPort } from './ports.js';
 
 const DEFAULT_SCRIPTS_DIR = 'E:\\B\\scripts';
 
@@ -110,7 +111,17 @@ function runCommand(spec, timeoutMs = 120_000) {
   const handle = openSync(logFile, 'a');
 
   return new Promise((resolve, reject) => {
-    const child = spawn(file, args, { windowsHide: true, stdio: ['ignore', handle, handle] });
+    // `env` carries values a service takes from the environment rather than from argv -
+    // the embedding server reads EMBED_PORT, which is how its port became dynamic without
+    // touching its code. Merged onto the inherited environment rather than replacing it,
+    // because these services need PATH for FFmpeg DLLs and similar.
+    const environment = spec.env ? { ...process.env, ...spec.env } : process.env;
+
+    const child = spawn(file, args, {
+      windowsHide: true,
+      stdio: ['ignore', handle, handle],
+      env: environment,
+    });
 
     let settled = false;
     let timer = null;
@@ -249,7 +260,7 @@ async function waitReady(resource, timeoutSec) {
 
   while (Date.now() < deadline) {
     // fresh: this loop exists to observe a change, so a cached answer would defeat it.
-    if (await isReachable(resource.ready.url, method, 5_000, { fresh: true })) return true;
+    if (await isReachable(readyUrl(resource), method, 5_000, { fresh: true })) return true;
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
   return false;
@@ -290,7 +301,7 @@ export async function start(id) {
 
   // Already up - but distinguish "we started it" from "a human did", so a later
   // idle release does not shut down something the operator wants to keep.
-  if (await isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
+  if (await isReachable(readyUrl(resource), resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
     registry.markExternal(id);
     state.state = 'ready';
     log.info(`${id} already running; leaving ownership alone`);
@@ -302,7 +313,11 @@ export async function start(id) {
   log.info(`starting ${id}`, { port: resource.port, vramMiB: resource.vramMiB });
 
   try {
-    const result = await runCommand(resource.start, resource.start.timeoutMs ?? 120_000);
+    // The allocated port is substituted into the command here rather than stored in the
+    // config: the config says `{port}` (or nothing), and the number only becomes real once
+    // it has been confirmed free. See ports.js.
+    const startSpec = applyPort(resource.start, resource.port);
+    const result = await runCommand(startSpec, resource.start.timeoutMs ?? 120_000);
     if (result.code !== 0) {
       // A launcher that exits non-zero usually explained itself on stdout; that text
       // is the only thing that says which failure mode this was.
@@ -316,7 +331,7 @@ export async function start(id) {
     // before reporting a failure. Combined with the file-based output above, this is
     // the second half of the same defence: the wait is not authoritative about whether
     // the process came up, only the readiness URL is.
-    if (await isReachable(resource.ready.url, resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
+    if (await isReachable(readyUrl(resource), resource.ready?.method ?? 'GET', 5_000, { fresh: true })) {
       log.warn(`${id} launcher timed out but the service is answering; treating it as started`);
       state.state = 'ready';
       state.startedByUs = true;
@@ -335,7 +350,7 @@ export async function start(id) {
 
   const timeoutSec = resource.ready?.timeoutSec ?? 180;
   if (!(await waitReady(resource, timeoutSec))) {
-    const message = `${id} did not answer ${resource.ready.url} within ${timeoutSec}s`;
+    const message = `${id} did not answer ${readyUrl(resource)} within ${timeoutSec}s`;
     registry.setError(id, message);
     log.error(message);
     // A service that never answered would otherwise sit on the card and block the
@@ -378,7 +393,7 @@ export async function stop(id, { force = false } = {}) {
 
   state.state = 'stopping';
 
-  if (!(await isReachable(resource.ready.url, 'GET', 3_000, { fresh: true }))) {
+  if (!(await isReachable(readyUrl(resource), 'GET', 3_000, { fresh: true }))) {
     state.state = 'idle';
     state.startedByUs = false;
     state.startedAt = null;
@@ -389,10 +404,13 @@ export async function stop(id, { force = false } = {}) {
 
   try {
     if (resource.stop?.url) {
-      // Graceful shutdown endpoint: these services flush and exit on their own.
-      await fetch(resource.stop.url, { method: 'POST' }).catch(() => {});
+      // Graceful shutdown endpoint: these services flush and exit on their own. The URL
+      // may contain {port} because the embedding server's port is no longer fixed.
+      const url = resource.stop.url.replaceAll('{port}', String(resource.port ?? ''));
+      await fetch(url, { method: 'POST' }).catch(() => {});
     } else {
-      const result = await runCommand(resource.stop, resource.stop.timeoutMs ?? 60_000);
+      const stopSpec = applyPort(resource.stop, resource.port);
+      const result = await runCommand(stopSpec, resource.stop.timeoutMs ?? 60_000);
       if (result.code !== 0) {
         log.warn(`${id} stop command exited ${result.code}`, (result.stderr || result.stdout).slice(0, 200));
       }
@@ -401,7 +419,7 @@ export async function stop(id, { force = false } = {}) {
     log.warn(`${id} stop command failed`, String(error?.message ?? error).slice(0, 200));
   }
 
-  const gone = await waitGone(resource.ready.url, resource.stop.waitSec ?? 30);
+  const gone = await waitGone(readyUrl(resource), resource.stop.waitSec ?? 30);
   state.state = 'idle';
   state.startedByUs = false;
   state.startedAt = null;

@@ -19,6 +19,7 @@
     "test:memory": "node src/test-memory.js",
     "test:delivery": "node src/test-prompt-delivery.js",
     "test:resources": "node src/test-resources.js",
+    "test:comfyapi": "node src/test-comfyapi.js",
     "test:crash": "node src/test-crash.js",
     "measure:image": "node src/measure-image.js"
   },

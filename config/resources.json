@@ -1,7 +1,9 @@
 {
   "gateway": {
     "port": 8790,
-    "host": "127.0.0.1"
+    "host": "127.0.0.1",
+    "backendPortBase": 8188,
+    "portScanSpan": 64
   },
   "master": {
     "enabled": true
@@ -23,6 +25,8 @@
       "start": {
         "script": "start_comfy.ps1",
         "args": [
+          "-Port",
+          "{port}",
           "-ReserveVram",
           "0"
         ]
@@ -35,7 +39,7 @@
         ]
       },
       "ready": {
-        "url": "http://127.0.0.1:8188/system_stats",
+        "path": "/system_stats",
         "timeoutSec": 180
       },
       "workflow": "qwen21-image.json",
@@ -44,14 +48,6 @@
         "prompt": {
           "node": "4",
           "field": "prompt"
-        }
-      },
-      "injectByWorkflow": {
-        "anima-image.json": {
-          "prompt": {
-            "node": "4",
-            "field": "text"
-          }
         }
       }
     },
@@ -67,6 +63,8 @@
       "start": {
         "script": "start_comfy.ps1",
         "args": [
+          "-Port",
+          "{port}",
           "-ReserveVram",
           "0"
         ]
@@ -79,7 +77,7 @@
         ]
       },
       "ready": {
-        "url": "http://127.0.0.1:8188/system_stats",
+        "path": "/system_stats",
         "timeoutSec": 180
       },
       "workflow": "anima-image.json",
@@ -103,6 +101,8 @@
       "start": {
         "script": "start_comfy.ps1",
         "args": [
+          "-Port",
+          "{port}",
           "-DisableDynamicVram"
         ]
       },
@@ -114,23 +114,34 @@
         ]
       },
       "ready": {
-        "url": "http://127.0.0.1:8188/system_stats",
+        "path": "/system_stats",
         "timeoutSec": 180
       },
+      "classes": [
+        "BreezeTTS2LoadModel",
+        "BreezeTTS2VoiceDesign",
+        "BreezeTTS2VoiceClone",
+        "BreezeTTS2VoiceDirection",
+        "LoadAudio",
+        "SaveAudioAdvanced"
+      ],
       "outputDir": "E:\\B\\output"
     },
     "tts": {
       "label": "语音 · GPT-SoVITS",
       "enabled": true,
       "exclusiveGroup": "gsv",
-      "port": 9880,
+      "port": 8189,
       "backend": "gsv",
       "vramMiB": 5000,
       "priority": 10,
       "keepAliveSec": 300,
       "start": {
         "script": "start_gsv.ps1",
-        "args": []
+        "args": [
+          "-Port",
+          "{port}"
+        ]
       },
       "stop": {
         "script": "stop_services.ps1",
@@ -140,7 +151,7 @@
         ]
       },
       "ready": {
-        "url": "http://127.0.0.1:9880/tts",
+        "path": "/tts",
         "timeoutSec": 180,
         "method": "HEAD"
       }
@@ -149,7 +160,7 @@
       "label": "记忆检索 · Qwen3-Embedding-0.6B",
       "enabled": true,
       "exclusiveGroup": "embed",
-      "port": 9820,
+      "port": 8190,
       "backend": "embed",
       "vramMiB": 1200,
       "priority": 20,
@@ -159,14 +170,17 @@
         "args": [
           "E:\\B\\embed-server\\serve.py"
         ],
+        "env": {
+          "EMBED_PORT": "{port}"
+        },
         "detached": true
       },
       "stop": {
-        "url": "http://127.0.0.1:9820/shutdown",
+        "url": "http://127.0.0.1:{port}/shutdown",
         "waitSec": 30
       },
       "ready": {
-        "url": "http://127.0.0.1:9820/health",
+        "path": "/health",
         "timeoutSec": 60
       }
     }

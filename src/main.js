@@ -17,6 +17,7 @@
 
 import { startServer } from './server.js';
 import { loadConfig } from './config.js';
+import { allocatePorts, snapshot as portSnapshot } from './ports.js';
 import * as scheduler from './scheduler.js';
 import * as heartbeat from './heartbeat.js';
 import { log } from './log.js';
@@ -86,6 +87,14 @@ async function main() {
   if (previous) log.warn(previous);
 
   log.info(`config loaded from ${Object.keys(config.resources).length} resources`);
+
+  // Ports are assigned here, not in the config: the config says `port: 0` (or a
+  // preference) and the gateway confirms a free number before any service is launched.
+  // That is what lets backend ports disappear from the caller's world entirely - the
+  // proxy path is stable regardless of which number a particular run happens to get.
+  await allocatePorts(config);
+  const assigned = portSnapshot();
+  log.info(`ports allocated: ${Object.entries(assigned).map(([id, port]) => `${id}=${port}`).join(', ')}`);
 
   for (const [id, resource] of Object.entries(config.resources)) {
     log.info(`  resource ${id}: port ${resource.port}, ${resource.vramMiB} MiB, priority ${resource.priority}, ` +
