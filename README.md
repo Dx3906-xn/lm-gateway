@@ -74,6 +74,31 @@ ports allocated: image=8188, anima=8188, breeze=8188, tts=8189, memory=8190
 
 ---
 
+## WebUI 能看到什么
+
+打开 http://127.0.0.1:8790/ ：
+
+| 面板 | 内容 |
+|---|---|
+| **显存** | 总量 / 已用 / 可用 / 安全余量。可用 = 扣掉余量后的真实可分配值 |
+| **能力路由** | 不指定 `resource` 时，`speak` / `image` / `search` 各会走哪个资源 |
+| **资源卡片** | 能力标签、状态、端口、显存、优先级、运行时长、保持时间倒计时、最近使用 |
+| **队列 / 最近错误** | 排队中的请求，以及各资源的 `lastError` |
+
+**卡片会主动解释"为什么拉不起来"**，按优先级只显示最主要的一个：
+
+```
+总控关 > 独立开关关 > 同组占用 > 显存不足
+```
+
+例如「同组资源 image 正占用该端口，需先停它」或「显存不足：需要 5500 MiB，当前可用 4496 MiB」。
+
+**忙碌时停止要确认**：`backendBusy` 为真说明后端正在执行图（ComfyUI 的后台执行，HTTP 请求
+已返回但图还在跑）。此时停止按钮变橙色并要求确认，因为会中断正在进行的生成——按钮本身
+保持可用，卡死的生成必须能中止。
+
+---
+
 ## 调用示例
 
 **主接口是 ComfyUI 的形状**——提交一张图，轮询拿结果。模型由网关从图里的节点类推断，
@@ -142,6 +167,12 @@ node src\test-memory.js          # 记忆检索端到端 + encodeVersion（约 3
 node src\test-prompt-delivery.js # prompt 真的进了模型？用 ComfyUI /history 复核（约 1 分钟）
 node src\test-resources.js       # 共用端口/独立控制/8790 代理（约 1 分钟）
 node src\test-comfyapi.js        # ComfyUI 形状接口 + 模型推断（约 2 分钟）
+node src\test-busy.js            # 生成期间不被停用（约 2 分钟）
+node src\test-capability.js      # 能力路由：不指定 resource 时选谁（约 3 分钟）
+node src\test-stale.js           # 后端进程死了，状态会自愈（约 2 分钟）
+node src\test-ui.js              # 面板契约：静态断言（约 20 秒，需 Edge）
+node src\test-ui.js --dynamic    # 面板：忙碌态 + 停止确认（约 2 分钟，真的生图）
+node src\measure-ui.js           # 布局数字：卡片等高 / 溢出 / 裁剪
 node src\test-crash.js           # 并发/中断/轮询压力：网关是否还活着（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```

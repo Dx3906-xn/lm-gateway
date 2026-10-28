@@ -16,7 +16,13 @@
 <header class="topbar">
   <div class="topbar__brand">
     <h1>lm-gateway</h1>
-    <span class="topbar__sub">本机 GPU 模型服务网关 · 127.0.0.1:8790</span>
+    <span class="topbar__sub">本机 GPU 模型服务网关</span>
+  </div>
+
+  <div class="topbar__facts" id="gw-facts">
+    <span class="fact"><i>入口</i><b>127.0.0.1:8790</b></span>
+    <span class="fact"><i>已运行</i><b id="gw-uptime">—</b></span>
+    <span class="fact"><i>排队</i><b id="gw-queue">—</b></span>
   </div>
 
   <div class="topbar__master">
@@ -50,7 +56,17 @@
       <span class="legend__item"><i class="swatch swatch--used"></i>已用 <b id="gpu-used">—</b></span>
       <span class="legend__item"><i class="swatch swatch--usable"></i>可用 <b id="gpu-usable">—</b></span>
       <span class="legend__item"><i class="swatch swatch--headroom"></i>安全余量 <b id="gpu-headroom">—</b></span>
+      <span class="legend__item legend__item--note">可用 = 用量扣掉安全余量后的真实可分配值</span>
     </div>
+  </section>
+
+  <section class="panel" id="panel-routing">
+    <div class="panel__head">
+      <h2>能力路由</h2>
+      <span class="panel__meta">调用不指定 resource 时，网关会选谁</span>
+    </div>
+    <div class="routes" id="routes"></div>
+    <p class="empty" id="routes-empty" hidden>等待 /api/status 返回 routing。</p>
   </section>
 
   <section class="panel">
@@ -83,8 +99,9 @@
 </main>
 
 <footer class="foot">
-  <span>数据来源：GET /api/status，每 2 秒轮询；任何操作后立即刷新。</span>
-  <span>保持时间：<code>0</code> = 用完立即停，<code>-1</code> = 常驻。</span>
+  <span>GET /api/status 每 2 秒轮询；任何操作后立即刷新。</span>
+  <span>保持时间 <code>0</code> = 用完立即停，<code>-1</code> = 常驻。</span>
+  <span>后端原生接口走 <code>/backends/&lt;资源id&gt;/</code>，不必知道后端端口。</span>
 </footer>
 
 <div id="toast" class="toast" hidden></div>

@@ -26,7 +26,10 @@
     "probe:widgets": "node src/probe-widgets.js",
     "measure:image": "node src/measure-image.js",
     "test:stale": "node src/test-stale.js",
-    "stress:status": "node src/stress-status.js"
+    "stress:status": "node src/stress-status.js",
+    "test:ui": "node src/test-ui.js",
+    "test:ui:dynamic": "node src/test-ui.js --dynamic",
+    "measure:ui": "node src/measure-ui.js"
   },
   "dependencies": {},
   "license": "MIT"

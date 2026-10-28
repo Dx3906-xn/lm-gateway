@@ -42,9 +42,20 @@
     idle: 'badge',
     starting: 'badge',
     ready: 'badge badge--on',
-    busy: 'badge badge--on',
+    busy: 'badge badge--busy',
     stopping: 'badge',
-    disabled: 'badge badge--off'
+    // Disabled is a deliberate choice, not a fault. Red implied breakage and made a
+    // switched-off resource look broken.
+    disabled: 'badge badge--disabled'
+  };
+
+  var STATE_CLASS = {
+    idle: 'card--idle',
+    starting: 'card--starting',
+    ready: 'card--ready',
+    busy: 'card--busy',
+    stopping: 'card--stopping',
+    disabled: 'card--disabled'
   };
 
   var ui = {};
@@ -127,8 +138,22 @@
       d = (isFinite(n) && String(ts).trim() !== '') ? new Date(n < 1e12 ? n * 1000 : n) : new Date(ts);
     }
     if (isNaN(d.getTime())) return String(ts);
-    return d.toLocaleTimeString('zh-CN', { hour12: false }) + ' ' + d.toLocaleDateString('zh-CN');
+
+    // Date first, then time, and only as much of each as is needed. The old format put the
+    // clock before the date ("21:07:37 2026/10/28"), which reads backwards in Chinese and
+    // makes the most useful part - how long ago - the hardest to find.
+    var now = new Date();
+    var sameDay = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate();
+    var hhmm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    if (sameDay) return hhmm;
+    var mmdd = pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+    if (d.getFullYear() === now.getFullYear()) return mmdd + ' ' + hhmm;
+    return d.getFullYear() + '-' + mmdd + ' ' + hhmm;
   }
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
   function stateText(state) {
     return STATE_TEXT[state] || (state ? String(state) : '未知');
@@ -332,11 +357,18 @@
     '  </div>',
     '  <span class="card__state badge" data-f="state">—</span>',
     '</div>',
+    // What this resource can do. Read from /api/status rather than hardcoded per id, so the
+    // panel answers "who would serve a speak request" with the same evidence the router uses.
+    '<div class="caps" data-f="caps"></div>',
     '<div class="meta">',
     '  <span class="meta__item">端口 <b data-f="port">—</b></span>',
     '  <span class="meta__item">显存 <b data-f="vram">—</b></span>',
     '  <span class="meta__item">优先级 <b data-f="priority">—</b></span>',
     '</div>',
+    // Shown only while the backend reports work in progress. Without it, "idle" and
+    // "100 seconds into a 137-second image" look identical - and stopping in the second
+    // case destroys the run.
+    '<div class="working" data-f="working" hidden></div>',
     '<div class="timers">',
     '  <span data-f="uptime">未运行</span>',
     '  <span data-f="keepalive">—</span>',
@@ -352,12 +384,13 @@
     '  </label>',
     '  <button type="button" class="btn--start" data-act="start" data-f="start">拉起</button>',
     '  <button type="button" class="btn--stop" data-act="stop" data-f="stop">停止</button>',
+    '  <button type="button" class="btn--ghost btn--tiny" data-act="copy" data-f="copy"',
+    '    title="复制调用地址">复制调用地址</button>',
     '</div>',
-    '<div class="card__row">',
+    '<div class="card__row card__row--foot">',
     '  <label class="keepalive">保持时间(秒)',
     '    <input type="number" step="1" min="-1" data-f="keepalive-input" title="整数：0 = 用完立即停，-1 = 常驻">',
     '  </label>',
-    '  <span class="hint">0 = 用完立即停，-1 = 常驻</span>',
     '</div>'
   ].join('\n');
 
@@ -401,7 +434,17 @@
     var busyState = r.state === 'starting' || r.state === 'stopping';
 
     if (card.refs.start) card.refs.start.disabled = locked || running || busyState;
-    if (card.refs.stop) card.refs.stop.disabled = locked || !running;
+    if (card.refs.stop) {
+      card.refs.stop.disabled = locked || !running;
+      // Stop stays enabled while the backend is working - an operator must be able to
+      // abort a wedged run - but it is marked, because in that state it discards work
+      // rather than releasing an idle model.
+      var risky = r.backendBusy === true;
+      card.refs.stop.classList.toggle('is-risky', risky);
+      card.refs.stop.title = risky
+        ? '后端正在执行图，停止会中断正在进行的生成'
+        : '停止该资源（释放显存）';
+    }
     if (card.refs.enabled) card.refs.enabled.disabled = !!card.lock || !online;
   }
 
@@ -411,6 +454,27 @@
     return null;
   }
 
+  /** Capability chips, coloured by kind so the shape of the fleet is visible at a glance. */
+  function renderCaps(refs, caps) {
+    if (!refs.caps) return;
+    refs.caps.textContent = '';
+    var list = Array.isArray(caps) ? caps : [];
+    if (list.length === 0) {
+      var none = document.createElement('span');
+      none.className = 'cap';
+      none.textContent = '无能力声明';
+      none.title = '该资源在 config 里没有能力，也未从后端/工作流推断出来';
+      refs.caps.appendChild(none);
+      return;
+    }
+    list.forEach(function (name) {
+      var chip = document.createElement('span');
+      chip.className = 'cap cap--' + String(name);
+      chip.textContent = String(name);
+      refs.caps.appendChild(chip);
+    });
+  }
+
   function updateCard(card, r, masterOn) {
     card.data = r;
     var el = card.el;
@@ -418,12 +482,15 @@
     var state = r.state || (r.running ? 'ready' : 'idle');
     var stateClass = STATE_TEXT[state] ? state : 'idle';
 
-    el.className = 'card card--' + stateClass + (r.enabled === false ? ' card--off' : '');
+    el.className = 'card ' + (STATE_CLASS[stateClass] || 'card--idle')
+      + (r.enabled === false ? ' card--disabled' : '');
 
     refs.title.textContent = r.label || r.id || card.id;
     refs.id.textContent = r.id || card.id;
     refs.state.className = 'card__state ' + (STATE_BADGE[state] || 'badge');
     refs.state.textContent = stateText(state);
+
+    renderCaps(refs, r.capabilities);
 
     // 端口展示要区分"后端进程端口"和"对外调用端口"，否则三个共用 8188 的资源
     // 看起来像配置错误。共用不是错误：监听同一个端口的服务只能有一个进程，所以
@@ -469,13 +536,65 @@
 
     refs.lastused.textContent = '最近使用 ' + fmtTime(r.lastUsedAt);
 
+    // Work in progress, from the backend's own report. `inflight` counts requests this
+    // process is serving; `backendBusy` is the one that catches a graph ComfyUI is still
+    // executing after its HTTP request returned - the difference between releasing an idle
+    // model and killing a running generation.
+    var inflight = typeof r.inflight === 'number' ? r.inflight : 0;
+    var working = r.backendBusy === true;
+    if (working || inflight > 0) {
+      var bits = [];
+      if (working) bits.push('后端正在执行图');
+      if (inflight > 0) bits.push(inflight + ' 个请求处理中');
+      refs.working.hidden = false;
+      refs.working.innerHTML = '<b>忙碌</b> · ' + bits.join(' · ')
+        + (working ? ' —— 此时停止会中断正在进行的生成' : '');
+    } else {
+      refs.working.hidden = true;
+      refs.working.textContent = '';
+    }
+
     var notes = [];
+    var masterOff = masterOn === false;
+    var switchedOff = r.enabled === false;
+    var groupBlocked = !!r.blockedByGroup;
+
     if (!online) notes.push('网关未连接');
-    else if (masterOn === false) notes.push('总控已关，无法拉起');
-    if (r.enabled === false) notes.push('独立开关已关，拒绝拉起');
+    else if (masterOff) notes.push('总控已关，无法拉起');
+    if (switchedOff) notes.push('独立开关已关，拒绝拉起');
     if (r.yielded === true) notes.push('已让位：为其他资源腾出显存，不再自动重启');
+    // Why a start would be refused even though this resource is enabled: another member of
+    // the same exclusive group owns the port. Naming it turns "start does nothing" into a
+    // readable answer.
+    if (groupBlocked) notes.push('同组资源 ' + r.blockedByGroup + ' 正占用该端口，需先停它');
+
+    // Say it before the click, not after. Without this the only way to learn that 5500 MiB
+    // does not fit in 4496 MiB was to press 拉起 and read the 503 - measured exactly that
+    // while testing, with memory's 1200 MiB still resident.
+    //
+    // Only when nothing else already explains the refusal. With the group blocked, the real
+    // reason is the port, and adding "显存不足" beside it both misleads and churns: the number
+    // moves every two seconds as the running model grows. Measured in the first version -
+    // breeze and anima showed both warnings at once, and the VRAM figure was a consequence of
+    // the other process, not the obstacle.
+    var usable = (latest && latest.gpu && typeof latest.gpu.usableMiB === 'number')
+      ? latest.gpu.usableMiB : null;
+    var shortOfVram = r.running !== true
+      && usable !== null && usable > 0
+      && typeof r.vramMiB === 'number' && r.vramMiB > usable
+      && !groupBlocked && !switchedOff && !masterOff;
+    if (shortOfVram) {
+      notes.push('显存不足：需要 ' + fmtMiB(r.vramMiB) + '，当前可用 ' + fmtMiB(usable) + '（拉起会被 503 拒绝）');
+    }
+
     refs.note.hidden = notes.length === 0;
     refs.note.textContent = notes.join('；');
+
+    if (refs.start) {
+      refs.start.title = shortOfVram
+        ? '显存不足：需要 ' + fmtMiB(r.vramMiB) + '，当前可用 ' + fmtMiB(usable)
+        : (groupBlocked ? '同组资源 ' + r.blockedByGroup + ' 正占用该端口' : '拉起该资源（按需加载模型）');
+    }
 
     if (r.lastError) {
       refs.error.hidden = false;
@@ -514,6 +633,7 @@
   }
 
   function tick() {
+    paintUptime();
     Object.keys(cards).forEach(function (id) {
       var card = cards[id];
       if (!card.data) return;
@@ -530,6 +650,103 @@
         card.refs.keepalive.textContent = keepAliveText(r, left);
       }
     });
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 能力路由
+   * ------------------------------------------------------------------ */
+
+  /* 能力的中文说明。`speak` 这类词是 API 字段名，界面上保留英文原文以便对照，
+     但补一句人话解释，否则"speak -> breeze"对不熟悉路由的人没有信息量。 */
+  var CAP_TEXT = {
+    speak: '语音合成',
+    image: '生成图片',
+    search: '记忆检索'
+  };
+
+  /**
+   * Render the routing decision table.
+   *
+   * `routing` comes straight from /api/status and is the decision the gateway would make
+   * right now, not a re-derivation on the client. That matters: a panel that works the
+   * answer out itself can disagree with the router, and then both are suspect.
+   */
+  function renderRouting(routing) {
+    if (!ui.routes) return;
+    ui.routes.textContent = '';
+
+    var map = (routing && typeof routing === 'object') ? routing : null;
+    // Fall back to the known capabilities when the gateway does not send a routing block,
+    // so an older gateway still renders something useful instead of an empty panel.
+    var keys = map ? Object.keys(map) : ['speak', 'image', 'search'];
+    ui['routes-empty'].hidden = keys.length > 0;
+    if (keys.length === 0) return;
+
+    keys.forEach(function (cap) {
+      var info = (map && map[cap]) || {};
+      var row = document.createElement('div');
+      row.className = 'route';
+
+      var name = document.createElement('span');
+      name.className = 'route__cap';
+      name.textContent = cap;
+      name.title = CAP_TEXT[cap] || cap;
+
+      var arrow = document.createElement('span');
+      arrow.className = 'route__arrow';
+      arrow.textContent = '→';
+
+      var target = document.createElement('span');
+      target.className = 'route__target';
+
+      var note = null;
+      if (!info.resource) {
+        row.className = 'route route--none';
+        target.textContent = '（无可用资源）';
+        target.title = '没有任何资源配置了该能力，调用会返回 400';
+      } else {
+        target.textContent = info.resource;
+        if (info.allDisabled === true) {
+          // The router still names a candidate so the refusal can explain itself; the panel
+          // must show the same thing, or it would claim a route that will actually 409.
+          row.className = 'route route--off';
+          note = document.createElement('span');
+          note.className = 'route__note';
+          note.textContent = '已禁用 · 调用会 409';
+        }
+      }
+
+      row.appendChild(name);
+      row.appendChild(arrow);
+      row.appendChild(target);
+      if (note) row.appendChild(note);
+      ui.routes.appendChild(row);
+    });
+  }
+
+  /** Header facts: gateway uptime and queue depth. */
+  function renderFacts(data) {
+    var gateway = (data && data.gateway) || {};
+    gwBootAt = (typeof gateway.uptimeSec === 'number')
+      ? Date.now() - gateway.uptimeSec * 1000
+      : null;
+    paintUptime();
+
+    var queue = Array.isArray(data && data.queue) ? data.queue.length : 0;
+    if (ui['gw-queue']) {
+      ui['gw-queue'].textContent = queue === 0 ? '空闲' : queue + ' 个';
+    }
+  }
+
+  /* The gateway's start time, reconstructed from uptimeSec on each poll. Kept so the tick
+     can advance the clock between polls without needing a new field from the server. */
+  var gwBootAt = null;
+
+  function paintUptime() {
+    if (!ui['gw-uptime']) return;
+    if (gwBootAt === null) { ui['gw-uptime'].textContent = '—'; return; }
+    var sec = Math.max(0, Math.floor((Date.now() - gwBootAt) / 1000));
+    ui['gw-uptime'].textContent = fmtDuration(sec) || '00:00';
   }
 
   /* ------------------------------------------------------------------ *
@@ -611,6 +828,8 @@
     }
 
     renderGpu(latest.gpu);
+    renderFacts(latest);
+    renderRouting(latest.routing);
 
     var resources = Array.isArray(latest.resources) ? latest.resources : [];
     var present = {};
@@ -697,6 +916,20 @@
 
   function stopResource(card) {
     if (card.lock) return;
+
+    // Confirm only in the case where stopping destroys something. Asking every time would
+    // train the operator to click through it; asking when a generation is running is the
+    // one moment the answer matters.
+    if (card.data && card.data.backendBusy === true) {
+      var label = card.data.label || card.data.id || card.id;
+      var ok = window.confirm(
+        '「' + label + '」的后端正在执行任务。\n\n' +
+        '现在停止会中断正在进行的生成，且该次结果无法恢复。\n' +
+        '确定要停止吗？'
+      );
+      if (!ok) return;
+    }
+
     card.lock = true;
     syncButtons(card, currentMasterOn());
     perform('res:' + card.id, function () {
@@ -705,6 +938,30 @@
       card.lock = false;
       syncButtons(card, currentMasterOn());
     });
+  }
+
+  /** Copy the proxy base for this resource, which is what plugins call instead of a port. */
+  function copyEndpoint(card) {
+    var id = (card.data && card.data.id) || card.id;
+    var text = 'http://' + location.host + '/backends/' + encodeURIComponent(id) + '/';
+    var done = function () { toast('已复制：' + text, 'ok'); };
+    var fallback = function () {
+      // navigator.clipboard needs a secure context; http://127.0.0.1 counts, but a textarea
+      // fallback keeps this working if the page is opened by another hostname.
+      var area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand('copy'); done(); } catch (e) { toast('复制失败：' + text, 'error'); }
+      document.body.removeChild(area);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
   }
 
   function commitKeepAlive(card, input) {
@@ -770,6 +1027,7 @@
       var act = btn.getAttribute('data-act');
       if (act === 'start') startResource(card);
       else if (act === 'stop') stopResource(card);
+      else if (act === 'copy') copyEndpoint(card);
     });
 
     ui.cards.addEventListener('change', function (ev) {
@@ -816,7 +1074,8 @@
      'conn-dot', 'conn-text', 'gpu-total', 'gpu-seg-used', 'gpu-seg-usable',
      'gpu-seg-headroom', 'gpu-used', 'gpu-usable', 'gpu-headroom', 'cards',
      'cards-empty', 'resources-summary', 'queue', 'queue-count', 'queue-empty',
-     'errors', 'errors-empty', 'toast'
+     'errors', 'errors-empty', 'toast',
+     'routes', 'routes-empty', 'gw-uptime', 'gw-queue'
     ].forEach(function (id) { ui[id] = $(id); });
 
     if (!ui.cards) return; // 页面结构缺失时安静退出，不留白屏异常

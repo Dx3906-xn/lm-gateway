@@ -6,6 +6,7 @@
   --bg-card: #1c212b;
   --bg-input: #11151c;
   --line: #2a3040;
+  --line-soft: #232936;
   --fg: #e6e9ef;
   --fg-dim: #9aa4b8;
   --fg-mute: #6c7689;
@@ -59,18 +60,27 @@ code {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
-  padding: 14px 20px;
+  gap: 14px 18px;
+  padding: 12px 20px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--line);
   position: sticky;
   top: 0;
   z-index: 20;
 }
+.topbar__brand { display: flex; align-items: baseline; gap: 10px; }
 .topbar__brand h1 { font-size: 18px; letter-spacing: .5px; }
 .topbar__sub { color: var(--fg-mute); font-size: 12px; }
+
+/* Small labelled facts. Kept as one row of "key value" pairs rather than a sentence, so
+ * uptime can change every second without the line reflowing. */
+.topbar__facts { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.fact { display: inline-flex; align-items: baseline; gap: 6px; font-size: 12px; }
+.fact i { color: var(--fg-mute); font-style: normal; }
+.fact b { color: var(--fg-dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+
 .topbar__master { display: flex; align-items: center; gap: 10px; margin-left: auto; }
-.topbar__conn { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); font-size: 12px; min-width: 160px; }
+.topbar__conn { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); font-size: 12px; min-width: 150px; }
 
 .dot {
   width: 9px; height: 9px; border-radius: 50%;
@@ -90,6 +100,9 @@ code {
 }
 .badge--on  { color: #bdf0d0; border-color: #23503a; background: #12291b; }
 .badge--off { color: #ffd9d6; border-color: #6b2b28; background: #3a1d1c; }
+/* A disabled resource is a choice, not a fault: red implies something went wrong. */
+.badge--disabled { color: var(--fg-mute); border-color: var(--line); background: var(--bg-input); }
+.badge--busy { color: #e2d2ff; border-color: #4b3570; background: #2a1f3d; }
 
 /* ---------- 开关 ---------- */
 
@@ -115,11 +128,12 @@ code {
 /* ---------- 布局 ---------- */
 
 main {
-  max-width: 1180px;
+  max-width: 1240px;
   margin: 0 auto;
   padding: 18px 20px 0;
   display: grid;
   gap: 16px;
+  align-content: start;
 }
 
 .panel {
@@ -133,7 +147,7 @@ main {
   margin-bottom: 12px;
 }
 .panel__head h2 { font-size: 15px; }
-.panel__meta { color: var(--fg-mute); font-size: 12px; margin-left: auto; }
+.panel__meta { color: var(--fg-mute); font-size: 12px; margin-left: auto; text-align: right; }
 
 .empty { color: var(--fg-mute); font-size: 13px; margin: 4px 0; }
 .empty[hidden] { display: none; }
@@ -153,17 +167,46 @@ main {
 .bar__seg--usable   { background: #2f7d51; }
 .bar__seg--headroom { background: #4a5064; }
 
-.legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 12px; color: var(--fg-dim); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: 12px; color: var(--fg-dim); }
 .legend__item { display: inline-flex; align-items: center; gap: 6px; }
-.legend__item b { color: var(--fg); font-weight: 600; }
+.legend__item b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.legend__item--note { color: var(--fg-mute); margin-left: auto; }
 .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .swatch--used     { background: #c8554c; }
 .swatch--usable   { background: #2f7d51; }
 .swatch--headroom { background: #4a5064; }
 
+/* ---------- 能力路由 ---------- */
+
+.routes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+
+.route {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-card);
+  font-size: 12px;
+}
+.route--off { border-color: #6b5327; background: #2a2317; }
+.route--none { border-color: var(--line); opacity: .7; }
+
+.route__cap {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--fg);
+  font-family: Consolas, monospace;
+  flex: none;
+}
+.route__arrow { color: var(--fg-mute); flex: none; }
+.route__target { color: #9dc0ff; font-family: Consolas, monospace; }
+.route__note { margin-left: auto; color: var(--warn); font-size: 11px; }
+
 /* ---------- 资源卡片 ---------- */
 
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; align-items: stretch; }
 
 .card {
   background: var(--bg-card);
@@ -178,20 +221,52 @@ main {
 .card--ready     { border-left-color: var(--ok); }
 .card--busy      { border-left-color: var(--busy); }
 .card--stopping  { border-left-color: var(--warn); }
-.card--disabled  { border-left-color: var(--err); opacity: .72; }
+.card--disabled  { border-left-color: #3a4150; background: #191d25; }
+.card--disabled .card__title { color: var(--fg-dim); }
 
 .card__head { display: flex; align-items: flex-start; gap: 10px; }
 .card__title { font-size: 15px; font-weight: 600; }
 .card__id { color: var(--fg-mute); font-size: 12px; font-family: Consolas, monospace; }
 .card__state { margin-left: auto; flex: none; }
 
+/* Capability chips. Rendered from /api/status capabilities, so the panel shows the same
+ * answer the router uses instead of a second opinion. */
+.caps { display: flex; flex-wrap: wrap; gap: 5px; }
+.cap {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  background: var(--bg-input);
+  font-family: Consolas, monospace;
+}
+.cap--image  { color: #9dc0ff; border-color: #2f4a78; background: #16233a; }
+.cap--speak  { color: #bdf0d0; border-color: #23503a; background: #12291b; }
+.cap--search { color: #ffe6bd; border-color: #6b5327; background: #2a2317; }
+
 .meta { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--fg-dim); }
-.meta__item b { color: var(--fg); font-weight: 600; }
+.meta__item b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.meta__item code { font-size: 11px; }
 
 .timers { font-size: 12px; color: var(--fg-dim); display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.timers span { font-variant-numeric: tabular-nums; }
 
 .note { font-size: 12px; color: var(--warn); }
 .note[hidden] { display: none; }
+
+/* Raised when the backend is mid-graph. This is the state in which stopping the service
+ * destroys work, so it gets its own colour rather than being folded into "busy". */
+.working {
+  font-size: 12px;
+  color: #e2d2ff;
+  background: #2a1f3d;
+  border: 1px solid #4b3570;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.working[hidden] { display: none; }
+.working b { color: #fff; }
 
 .card__error {
   font-size: 12px;
@@ -205,10 +280,11 @@ main {
 .card__error[hidden] { display: none; }
 
 .card__row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.card__row--foot { margin-top: auto; }
 
 .keepalive { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-dim); }
 .keepalive input {
-  width: 78px;
+  width: 92px;
   background: var(--bg-input);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -216,6 +292,8 @@ main {
   padding: 4px 6px;
   font: inherit;
   font-size: 12px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .keepalive input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
 .keepalive input.is-dirty { border-color: var(--accent); }
@@ -242,6 +320,14 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .btn--start:hover:not(:disabled) { background: #277248; }
 .btn--stop { border-color: #6b2b28; background: #4a2321; }
 .btn--stop:hover:not(:disabled) { background: #5c2b28; }
+/* Stopping while the backend is generating is allowed but flagged, because it discards
+ * work in progress rather than releasing an idle model. */
+.btn--stop.is-risky { border-color: #7a4a1f; background: #3d2a14; color: #ffe6bd; }
+
+.btn--ghost { background: transparent; border-color: var(--line); color: var(--fg-dim); }
+.btn--ghost:hover:not(:disabled) { background: #232936; color: var(--fg); }
+
+.btn--tiny { padding: 2px 8px; font-size: 11px; }
 
 /* ---------- 队列 ---------- */
 
@@ -257,7 +343,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .qrow:last-child { margin-bottom: 0; }
 .qrow__id { font-family: Consolas, monospace; color: var(--fg-mute); }
 .qrow__res { font-weight: 600; }
-.qrow__wait { margin-left: auto; color: var(--fg-dim); }
+.qrow__wait { margin-left: auto; color: var(--fg-dim); font-variant-numeric: tabular-nums; }
 
 /* ---------- 错误汇总 ---------- */
 
@@ -280,7 +366,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   left: 50%;
   bottom: 22px;
   transform: translateX(-50%);
-  max-width: min(560px, 92vw);
+  max-width: min(600px, 92vw);
   padding: 9px 16px;
   border-radius: 8px;
   font-size: 13px;
@@ -293,21 +379,30 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .toast[hidden] { display: none; }
 .toast--ok    { background: #12291b; border-color: #23503a; color: #bdf0d0; }
 .toast--error { background: #3a1d1c; border-color: #6b2b28; color: #ffd9d6; }
+.toast--warn  { background: #3a2c14; border-color: #6b5327; color: #ffe6bd; }
 
 /* ---------- 页脚 ---------- */
 
 .foot {
-  max-width: 1180px;
-  margin: 4px auto 0;
+  max-width: 1240px;
+  margin: 14px auto 0;
   padding: 0 20px;
-  display: flex; flex-wrap: wrap; gap: 16px;
+  display: flex; flex-wrap: wrap; gap: 6px 18px;
   color: var(--fg-mute);
   font-size: 12px;
 }
 
-@media (max-width: 560px) {
+@media (max-width: 760px) {
   .topbar { gap: 10px; }
-  .topbar__master { margin-left: 0; }
-  .topbar__conn { min-width: 0; }
+  .topbar__facts { order: 3; width: 100%; }
+  .topbar__master { margin-left: auto; }
+  .topbar__conn { min-width: 0; order: 2; }
+  .legend__item--note { margin-left: 0; }
+}
+
+@media (max-width: 560px) {
+  main { padding: 14px 12px 0; }
   .cards { grid-template-columns: 1fr; }
+  .routes { grid-template-columns: 1fr; }
+  .panel__meta { display: none; }
 }
