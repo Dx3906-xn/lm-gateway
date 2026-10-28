@@ -1,0 +1,103 @@
+{
+  "1": {
+    "class_type": "BreezeTTS2LoadModel",
+    "inputs": {
+      "model": "int8 hybrid (recommended)",
+      "dtype": "auto",
+      "device": "auto",
+      "attention": "sdpa",
+      "decode_mode": "eager",
+      "download_if_missing": false
+    }
+  },
+  "2": {
+    "class_type": "BreezeTTS2VoiceDesign",
+    "inputs": {
+      "breeze_model": [
+        "1",
+        0
+      ],
+      "text": "老大 我今天不想动 就在这趴着吧",
+      "instruction": "一位温柔自信的年轻女性，声音清晰，语气亲切，表达轻快而富有感染力。",
+      "cfg_scale": 4.0,
+      "max_new_tokens": 1500,
+      "temperature": 0.9,
+      "top_k": 50,
+      "top_p": 1.0,
+      "repetition_penalty": 1.1,
+      "depth_temperature": 0.9,
+      "depth_top_k": 50,
+      "depth_top_p": 1.0,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "ref-1.wav"
+    }
+  },
+  "4": {
+    "class_type": "BreezeTTS2VoiceClone",
+    "inputs": {
+      "breeze_model": [
+        "1",
+        0
+      ],
+      "text": "老大 我今天不想动 就在这趴着吧",
+      "reference_audio": [
+        "3",
+        0
+      ],
+      "reference_text": "我之前听泰国歌曲好倒掉然后跟人家接",
+      "cfg_scale": 1.0,
+      "max_new_tokens": 1500,
+      "temperature": 0.9,
+      "top_k": 50,
+      "top_p": 1.0,
+      "repetition_penalty": 1.1,
+      "depth_temperature": 0.9,
+      "depth_top_k": 50,
+      "depth_top_p": 1.0,
+      "seed": 42
+    }
+  },
+  "5": {
+    "class_type": "BreezeTTS2VoiceDirection",
+    "inputs": {
+      "breeze_model": [
+        "1",
+        0
+      ],
+      "text": "老大 我今天不想动 就在这趴着吧",
+      "reference_audio": [
+        "3",
+        0
+      ],
+      "reference_text": "我之前听泰国歌曲好倒掉然后跟人家接",
+      "instruction": "用懒散拖长的语气说话，像刚睡醒，声音低一些，语速慢。",
+      "cfg_scale": 4.0,
+      "stitch_reference": "none",
+      "max_new_tokens": 1500,
+      "temperature": 0.9,
+      "top_k": 50,
+      "top_p": 1.0,
+      "repetition_penalty": 1.1,
+      "depth_temperature": 0.9,
+      "depth_top_k": 50,
+      "depth_top_p": 1.0,
+      "seed": 42
+    }
+  },
+  "9": {
+    "class_type": "SaveAudioAdvanced",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ],
+      "filename_prefix": "breeze",
+      "format": "flac"
+    }
+  }
+}

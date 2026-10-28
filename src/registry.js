@@ -128,6 +128,21 @@ export function describe(config, id) {
     yielded: state.yielded,
     inflight: state.inflight,
     /**
+     * Whether the *backend* is doing work, as opposed to whether a request is in flight.
+     *
+     * These are different questions, and conflating them stopped a generation mid-way.
+     * ComfyUI's POST /prompt returns a prompt_id immediately and executes in the
+     * background, so `inflight` (requests this process is serving) drops to zero while the
+     * model is still sampling. The idle timer consulted `inflight`, concluded nothing was
+     * happening, and stopped a service that was 100 seconds into a 137-second image.
+     *
+     * Set by scheduler.probeBackendActivity, which asks the backend itself. Null means
+     * unknown - a backend that does not report queue state, or a failed probe - and callers
+     * must treat unknown as "might be busy", never as "idle".
+     */
+    backendBusy: state.backendBusy ?? false,
+    backendBusyDetail: state.backendBusyDetail ?? null,
+    /**
      * Whether this resource is the one currently loaded on a shared port.
      *
      * Three resources drive ComfyUI on 8188, and a port has one listener, so at most one
@@ -177,6 +192,20 @@ export function setError(id, message) {
 /** Note that a request just used this resource. */
 export function touch(id) {
   entry(id).lastUsedAt = Date.now();
+}
+
+/**
+ * Record whether the backend itself reports work in progress.
+ *
+ * @param {string} id - resource id.
+ * @param {boolean} busy - whether the backend is executing.
+ * @param {object|null} detail - what it said, for diagnostics.
+ */
+export function setBackendBusy(id, busy, detail = null) {
+  const state = entry(id);
+  state.backendBusy = Boolean(busy);
+  state.backendBusyDetail = detail;
+  if (busy) state.lastUsedAt = Date.now();
 }
 
 export { STATES };

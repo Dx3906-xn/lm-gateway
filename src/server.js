@@ -230,6 +230,25 @@ async function handleStatus() {
     }
   }));
 
+  // Refresh the backend-busy flag for every resource that is up. This is what tells an
+  // operator (and the idle timer) the difference between "nothing is happening" and
+  // "ComfyUI is 100 seconds into a 137-second image". Probed in parallel and cached by the
+  // backend's own cheap endpoints; a resource that is not running is known idle without a
+  // call.
+  await Promise.all(resources.map(async (entry) => {
+    if (entry.state !== 'ready' && entry.state !== 'busy') {
+      entry.backendBusy = false;
+      return;
+    }
+    try {
+      const busy = await scheduler.refreshBackendBusy(entry.id);
+      entry.backendBusy = busy === true;
+    } catch {
+      // Unknown stays unknown; the entry keeps its previous reading rather than claiming
+      // idle, because claiming idle is what stops a working model.
+    }
+  }));
+
   return {
     master: config.master?.enabled ?? true,
     gateway: { port: config.gateway.port, uptimeSec: Math.round(process.uptime()) },
@@ -617,6 +636,40 @@ async function proxyToBackend(request, response, resourceId, rest) {
   for await (const chunk of request) chunks.push(chunk);
   const body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
 
+  /**
+   * Read-only backend paths go straight through when the service is already up.
+   *
+   * Routing everything through `scheduler.run` put `/queue` and `/history` behind the same
+   * serial chain as the work itself, so a status poll queued behind a running generation
+   * and eventually timed out - which made the gateway unable to ask its own backend the one
+   * question it needs answered ("are you busy?"). A read of state is not work: it must not
+   * wait for work, must not count as "in use", and must not start a service that is down
+   * (the caller can see that from the connection error).
+   */
+  const pathOnly = rest.split('?')[0];
+  const readOnly = request.method === 'GET'
+    && /^\/(queue|history|system_stats|object_info|view|models)(\/|$)/.test(pathOnly);
+
+  if (readOnly) {
+    // Tried regardless of the reported state, because the state is exactly what is in
+    // doubt: a resource is `starting` while its port may already be listening, and waiting
+    // for the scheduler to say "ready" put a 3-second status read behind a 20-second model
+    // load - measured at 56 seconds of queueing for one `/queue` call. If nothing is
+    // listening the fetch fails in milliseconds and the managed path below takes over.
+    try {
+      const upstream = await fetch(target, { method: 'GET', signal: AbortSignal.timeout(5_000) });
+      const payload = Buffer.from(await upstream.arrayBuffer());
+      const headers = {};
+      const type = upstream.headers.get('content-type');
+      if (type) headers['Content-Type'] = type;
+      response.writeHead(upstream.status, headers);
+      response.end(payload);
+      return;
+    } catch {
+      // Not up yet, or it died. The managed path below handles both.
+    }
+  }
+
   // Same serialization and admittance as a normal call, so the model starts on demand and
   // the idle timer is cancelled by the fact that somebody is using it.
   const started = Date.now();
@@ -642,6 +695,15 @@ async function proxyToBackend(request, response, resourceId, rest) {
     log.info(`proxy ${request.method} /backends/${resourceId}/${rest.split('?')[0]} -> ` +
       `${upstream.status} in ${Date.now() - started}ms`);
   });
+
+  // A proxied submission is answered long before the work is done. Re-read the backend's
+  // own queue state right away so `backendBusy` is accurate from the first moment, rather
+  // than only after the idle timer's next check. Without this there is a window in which
+  // the resource looks idle while ComfyUI is already sampling - which is exactly when a
+  // short keepAlive would have stopped it.
+  if (request.method === 'POST' && /\/(prompt|queue)$/.test(rest.split('?')[0])) {
+    void scheduler.refreshBackendBusy(resourceId).catch(() => {});
+  }
   // Errors are deliberately not caught here: scheduler.run throws DisabledError or
   // NoRoomError, and sendError (in the caller) maps those to the same 409/503 a business
   // call would have produced. Swallowing them would make the back door behave differently

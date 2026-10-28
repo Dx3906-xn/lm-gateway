@@ -243,6 +243,119 @@ function disarm(id) {
 }
 
 /**
+ * Ask the gateway's own record whether it has work outstanding for a resource.
+ *
+ * This is the signal that was missing, and it is entirely local. `comfyapi.submitPrompt`
+ * records an execution as `completed: false` the moment it accepts a graph, and only marks
+ * it complete when the run finishes. So an unfinished entry for this resource *is* work in
+ * progress, known without asking any backend.
+ *
+ * Probing the backend instead was the wrong idea, and the measurements say why:
+ * ComfyUI's `/queue` reports `queue_running`, `queue_pending` and `/history` entries, and
+ * during a Qwen-Image run all three were empty while the graph was demonstrably sampling.
+ * A probe built on those would have concluded "idle" at exactly the moment the service must
+ * not be stopped - which is the reported bug, reintroduced.
+ *
+ * The backend probe is kept below as a secondary check for graphs submitted directly to
+ * ComfyUI (through `/backends/<id>/prompt`), which this process never records.
+ *
+ * @param {string} id - resource id.
+ * @returns {boolean} whether this process has unfinished work for the resource.
+ */
+function hasUnfinishedExecutions(id) {
+  const executions = globalThis.__lmGatewayExecutions;
+  if (!(executions instanceof Map)) return false;
+
+  for (const entry of executions.values()) {
+    if (entry?.resource !== id) continue;
+    if (entry?.status?.completed === true) continue;
+    if (entry?.status?.status_str === 'error') continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Ask the backend whether it is executing something right now.
+ *
+ * Only ComfyUI reports its own state, and only partially - see the note above. GPT-SoVITS
+ * and the embedding server answer synchronously, so a request *is* the work and `inflight`
+ * already covers them.
+ *
+ * A failure returns `null` (unknown) rather than `false`: an unreachable backend is not
+ * evidence of idleness, and treating it as idle is how you stop a service that is alive.
+ *
+ * @param {object} config - loaded config.
+ * @param {object} resource - the resource in question.
+ * @returns {Promise<boolean|null>} true/false, or null when it could not be determined.
+ */
+export async function probeBackendActivity(config, resource) {
+  if (resource.backend !== 'comfy') return null;
+
+  const base = ports.backendUrl(resource);
+
+  try {
+    const queueResponse = await fetch(`${base}/queue`, { signal: AbortSignal.timeout(3_000) });
+    if (!queueResponse.ok) return null;
+    const queue = await queueResponse.json();
+    const running = queue?.queue_running?.length ?? 0;
+    const pending = queue?.queue_pending?.length ?? 0;
+    if (running + pending > 0) return true;
+
+    // Not in the queue. History is the other place ComfyUI reports in-flight work, though
+    // measured on this machine it did not show a running graph either - hence the local
+    // check in hasUnfinishedExecutions, which is the one that actually works.
+    const historyResponse = await fetch(`${base}/history`, { signal: AbortSignal.timeout(3_000) });
+    if (!historyResponse.ok) return null;
+    const history = await historyResponse.json();
+
+    for (const entry of Object.values(history ?? {})) {
+      if (entry && entry.status && entry.status.completed !== true) return true;
+    }
+
+    return false;
+  } catch {
+    // Unknown, not idle. See the note above.
+    return null;
+  }
+}
+
+/**
+ * Refresh the backend-busy flag for one resource.
+ *
+ * Combines both signals: what this process knows it submitted, and what the backend says.
+ * Either one reporting work means busy.
+ *
+ * @param {string} id - resource id.
+ * @returns {Promise<boolean|null>} the state, or null when unknown.
+ */
+export async function refreshBackendBusy(id) {
+  const config = getConfig();
+  const resource = config.resources[id];
+  if (!resource) return null;
+
+  const state = registry.entry(id);
+  const ready = state.state === 'ready' || state.state === 'busy';
+  if (!ready) {
+    registry.setBackendBusy(id, false, null);
+    return false;
+  }
+
+  // Local record first: it is authoritative for anything submitted through this gateway,
+  // and it cannot be wrong about a graph it accepted.
+  if (hasUnfinishedExecutions(id)) {
+    registry.setBackendBusy(id, true, { source: 'executions' });
+    return true;
+  }
+
+  const busy = await probeBackendActivity(config, resource);
+  registry.setBackendBusy(id, busy === true, {
+    source: busy === null ? 'unknown' : 'backend',
+  });
+  return busy;
+}
+
+/**
  * Arm the idle release for a resource.
  *
  * keepAliveSec is read fresh from config every time, so a WebUI change applies to the
@@ -250,6 +363,16 @@ function disarm(id) {
  *   > 0  release after that many seconds
  *   = 0  release as soon as the request finishes
  *   = -1 stay resident until asked otherwise
+ *
+ * The timer re-checks two things before acting, and both matter:
+ *
+ *   inflight      a request this process is serving
+ *   backendBusy   work the backend is doing on its own, which is the case ComfyUI's
+ *                 submit-and-poll protocol creates
+ *
+ * If either is true, it re-arms instead of stopping: the idle window restarts, so a
+ * long generation keeps its service alive for as long as it needs, and the resource still
+ * goes back to idle afterwards. Skipping the check is what stopped a generation halfway.
  *
  * @param {string} id - resource id.
  */
@@ -274,7 +397,28 @@ function arm(id) {
     state.keepAliveDeadline = null;
     // Routed through the serial chain so an idle stop cannot overlap an acquire.
     void serial(async () => {
-      if (registry.entry(id).inflight > 0) return;
+      if (registry.entry(id).inflight > 0) {
+        log.info(`${id} is serving a request; not releasing`);
+        arm(id);
+        return;
+      }
+
+      // The backend may still be working on something whose HTTP request already
+      // returned. Ask before stopping.
+      const busy = await refreshBackendBusy(id).catch(() => null);
+      if (busy === true) {
+        log.info(`${id} is still working in the backend; not releasing`);
+        arm(id);
+        return;
+      }
+      if (busy === null) {
+        // Could not tell. Not releasing is the safe direction: leaving a model resident
+        // costs VRAM until the next check, whereas stopping it destroys work in progress.
+        log.warn(`${id} backend activity unknown; not releasing this round`);
+        arm(id);
+        return;
+      }
+
       const current = getConfig().resources[id];
       if (!current?.enabled) return;
       try {

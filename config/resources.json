@@ -42,7 +42,7 @@
         "path": "/system_stats",
         "timeoutSec": 180
       },
-      "workflow": "qwen21-image.json",
+      "workflow": "qwen21-image-api.json",
       "outputDir": "E:\\B\\output",
       "inject": {
         "prompt": {
@@ -80,7 +80,7 @@
         "path": "/system_stats",
         "timeoutSec": 180
       },
-      "workflow": "anima-image.json",
+      "workflow": "anima-image-api.json",
       "outputDir": "E:\\B\\output",
       "inject": {
         "prompt": {

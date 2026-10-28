@@ -620,6 +620,10 @@ Breeze（`resource: "breeze"`）要 `mode`，并按模式给参数：
 | 21 | 跑不了的图在加载前拒绝 | `test-comfyapi`：未知节点 → **400**，不是让模型先加载再报错 |
 | 22 | `/history` 的计时字段是真实数字 | `test-comfyapi` 26/26：`elapsedSec=4.1` 非 null；`generateSec + loadSec ≈ elapsedSec`；**且 `elapsedSec` 与客户端实测相差 ≤3 秒** |
 | 23 | 冷启动能被计时区分出来 | 实测 `elapsedSec 20.5 / generateSec 7.1 / loadSec 13.4`（客户端实测 20.6） |
+| 24 | **生成期间不会被停用** | `test-busy` 9/9：keepAlive 设 10 秒、单图约 45 秒，**过了 keepAlive 仍在跑**，最终 `success` |
+| 25 | 忙碌状态可见且会复位 | `test-busy`：生成中 `backendBusy=true`，完成后回到 `false` |
+| 26 | 三套工作流的 UI 格式可被 ComfyUI 打开 | `validate_ui_workflow.py` 对三份全部 `ok`（节点、widget 顺序、连线均与活服务 schema 一致） |
+| 27 | WebUI 拉起不再误报超时 | 控制请求超时 240 秒（原为 5 秒） |
 
 复跑：
 
@@ -632,6 +636,7 @@ node src\test-memory.js          # 记忆检索端到端（约 30 秒）
 node src\test-prompt-delivery.js # prompt 真的进了模型（约 1 分钟）
 node src\test-resources.js       # 共用端口 / 独立控制 / 代理（约 1 分钟）
 node src\test-comfyapi.js        # ComfyUI 形状接口 + 模型推断（约 2 分钟）
+node src\test-busy.js            # 生成期间不被停用（约 2 分钟）
 node src\test-crash.js           # 并发压力（约 1 分钟）
 node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3 分钟）
 ```
@@ -652,6 +657,13 @@ node src\measure-image.js "提示词"   # 端到端生图 + 显存采样（约 3
   文档里出现的 8188 只是默认起点（`backendPortBase`），不是保证
 - **`{port}` 占位只在 `start`/`stop` 生效**：`ready.path` 自动拼端口，不要手写完整 URL
 - **`/prompt` 的模型推断靠 `class_type`**：自造节点类的图会被 400 拒绝——这是设计，不是缺陷
+- **ComfyUI 的 `/queue` 和 `/history` 看不到"正在执行"**：实测生成期间两者都是空的
+  （提示词被取走后就不再出现在 queue 里）。**判断忙闲必须用网关自己的未完成执行记录**，
+  不能靠探测后端
+- **`/prompt` 的提交是"立即返回"的**：HTTP 请求结束不等于活干完。任何"请求结束就认为空闲"
+  的逻辑都会在长图生成中途停掉服务
+- **ComfyUI 按图内容缓存**：相同 seed 的重复图约 1 秒返回，队列全程为空。
+  测试要变 seed，否则观察不到忙碌窗口
 - **冷启动**：ComfyUI 约 17–70 秒（视缓存）；GPT-SoVITS 约 70 秒
 - **`cuda_graphs` 模式会崩 ComfyUI**，Breeze 一律用 `eager`（代码内固定）
 - **启动命令的输出必须写文件不能走管道**：`Start-Process` 的子进程会继承管道，
@@ -835,6 +847,82 @@ score = -unused;
 `image`/`anima`/`breeze` 是同一个 ComfyUI 进程的三套配置。给它们各分一个端口会让
 "任一时刻只有一个在跑"这个保证失效——三个不同端口看起来就是三个独立服务，而它们不是。
 所以 `allocatePorts` 先按组分配，组内成员共享同一个号。
+
+### 第八轮：生成到一半模型被停用 / WebUI 拉起报错 / 需要工作流文件
+
+#### ① 生成中途被停（最严重）
+
+**现象**：经 API 调用 Qwen-Image，生成到一半模型被网关停用。
+
+**机制**（读代码即可确认）：ComfyUI 的 `POST /prompt` **立即返回 `prompt_id`，在后台执行**。
+所以 `scheduler.run` 的 work 函数在拿到 id 的那一刻就结束了，`inflight` 归零、idle 计时开始，
+而 ComfyUI 还没开始采样。Qwen-Image 512px 要 45 秒，冷启动更久——180 秒的 keepAlive 只是
+运气好；换更长的图或冷启动，就会在生成中途被停。
+
+**关键难点：ComfyUI 的状态接口看不到正在执行**。实测生成期间：
+
+```
+/queue        queue_running=[]  queue_pending=[]        ← 空的
+/history      没有未完成条目                              ← 空的
+```
+
+提示词只在**排队**时出现在 queue 里，被取走后就开始执行、两个接口都不再有痕迹。
+所以「探测 ComfyUI 来判断忙不忙」这条路是错的——我一开始就是这么做的，测试立刻失败。
+
+**正确的信号在网关自己手里**：`comfyapi.submitPrompt` 受理一张图时就把执行记成
+`completed: false`，跑完才改 true。**有未完成的执行 = 有活**，这个记录不可能错，
+因为它是网关自己收下的。
+
+实现上 `scheduler.hasUnfinishedExecutions()` 读 `globalThis.__lmGatewayExecutions`
+（comfyapi 在模块加载时发布，避免循环 import），而 idle 计时器到期时：
+
+| 检查 | 动作 |
+|---|---|
+| `inflight > 0` | 重新计时，不停 |
+| 有未完成执行 | 重新计时，不停 |
+| 后端探测返回 `null`（未知） | **重新计时，不停**——未知不等于空闲 |
+| 确认空闲 | 停止服务 |
+
+后端探测保留为**次要**信号，覆盖直接经 `/backends/<id>/prompt` 提交、网关没记录的图。
+
+**测试**（`test-busy.js` 9/9）故意把 keepAlive 设成 10 秒而单张图要 45 秒，
+无修复必死；关键断言是「过了 keepAlive 仍在跑」。第一版测试用固定 sleep 断言、
+还对 `/queue` 断言，**两次都是测试自己的错**，已改成轮询并去掉错误前提。
+
+#### ② WebUI 手动拉起弹窗报错
+
+**根因**：WebUI 的请求超时统一是 **5 秒**，而拉起 qwen-image 需要 30–70 秒。超时后弹
+「无法连接网关」，但后端其实正在正常启动——一个吓人的错误弹窗对应一次正常操作。
+
+修法：控制类请求（start/stop/总控关）用 `ACTION_TIMEOUT_MS = 240000`，状态轮询保持 5 秒。
+
+#### ③ 提供三套工作流
+
+`config/workflows/` 现在各有 API 与 UI 两种格式：
+
+| 文件 | 节点 | 模型 |
+|---|---|---|
+| `qwen21-image-{api,ui}.json` | 7 | Qwen-Image 2.1 |
+| `anima-image-{api,ui}.json` | 9 | Anima Turbo v1.1 |
+| `breeze-tts-{api,ui}.json` | 6 | Breeze TTS 2 |
+
+生成脚本 `E:\B\scripts\export_all_workflows.py`。**UI 格式供 ComfyUI 拖拽打开**，
+API 格式供 `POST /prompt`。两者从同一份定义生成，否则画布上看到的和实际跑的会不一致。
+
+Breeze 是特殊情况：它的图由 `backends/breeze.js` 代码现拼，原本没有 JSON。导出的文件
+把 design / clone / direction 三个模式节点都放上，只有 design 接到保存节点——因为画布
+不能让两条分支进同一个输入。打开后可自行换。
+
+**校验时抓到的两个校验器缺陷**（`validate_ui_workflow.py`）：
+
+1. 它按**字段名**判断是不是 link（`model`、`audio` 一律当 link），但
+   `BreezeTTS2LoadModel.model` 是**下拉框 widget**，而 `KSampler.model` 才是 link。
+   判断依据必须是**类型**（link 的首元素是类型名如 `"MODEL"`，widget 是选项列表或
+   `"STRING"/"INT"`）。按名字判导致整份文件"少一个 widget"的假警报，我去改本来正确的代码。
+2. 它只统计 `required` 里的输入，但画布也会为 `optional` 输入存 widget 值。
+   Breeze 的大部分生成参数在 `optional` 里，于是每个节点都"少算"。
+
+另外 `CLIPLoader` 的 `device` 是 optional 但画布仍存值，widget 表里必须带上。
 
 ### 第七轮：`elapsedSec` 恒为 null
 

@@ -11,7 +11,18 @@
   'use strict';
 
   var POLL_MS = 2000;
+
+  // Timeout for the 2-second status poll. Short on purpose: a poll that has not answered
+  // in a few seconds means the gateway is in trouble, and waiting longer only delays the
+  // "网关未启动" banner.
   var TIMEOUT_MS = 5000;
+
+  // Timeout for control actions. These are NOT quick: 启动 a resource blocks until the
+  // service answers, and ComfyUI needs 30-70 seconds to load a model. A single 5-second
+  // budget for both kinds of request made the start button report "无法连接网关" while the
+  // backend was starting perfectly well - a scary error for a normal operation, and it
+  // left the user thinking they had to retry.
+  var ACTION_TIMEOUT_MS = 240000;
 
   var PATHS = {
     status: '/api/status',
@@ -177,14 +188,22 @@
    * HTTP
    * ------------------------------------------------------------------ */
 
-  function request(method, url, body) {
+  /**
+   * One HTTP call.
+   *
+   * `timeoutMs` defaults to the poll budget, because most calls are polls. Control actions
+   * pass the longer one: starting a model legitimately takes a minute, and treating that as
+   * a transport failure is how a working start produced an error dialog.
+   */
+  function request(method, url, body, timeoutMs) {
+    var budget = timeoutMs || TIMEOUT_MS;
     var opts = { method: method, cache: 'no-store' };
     var ctrl = null;
     var timer = null;
     if (typeof AbortController === 'function') {
       ctrl = new AbortController();
       opts.signal = ctrl.signal;
-      timer = setTimeout(function () { ctrl.abort(); }, TIMEOUT_MS);
+      timer = setTimeout(function () { ctrl.abort(); }, budget);
     }
     if (body !== undefined) {
       opts.headers = { 'Content-Type': 'application/json' };
@@ -646,7 +665,9 @@
   function toggleMaster(enabled) {
     if (locks.master) return;
     perform('master', function () {
-      return request('POST', PATHS.master, { enabled: !!enabled });
+      // Turning the master switch off stops every service, which can take a while; on
+      // takes effect immediately.
+      return request('POST', PATHS.master, { enabled: !!enabled }, enabled ? TIMEOUT_MS : ACTION_TIMEOUT_MS);
     }, enabled ? '总控已开启' : '总控已关闭（全部拒绝拉起并停止）');
   }
 
@@ -667,8 +688,8 @@
     card.lock = true;
     syncButtons(card, currentMasterOn());
     perform('res:' + card.id, function () {
-      return request('POST', apiResource(card.id) + '/start');
-    }, '已请求拉起：' + card.id, card).then(function () {
+      return request('POST', apiResource(card.id) + '/start', undefined, ACTION_TIMEOUT_MS);
+    }, '已拉起：' + card.id, card).then(function () {
       card.lock = false;
       syncButtons(card, currentMasterOn());
     });
@@ -679,8 +700,8 @@
     card.lock = true;
     syncButtons(card, currentMasterOn());
     perform('res:' + card.id, function () {
-      return request('POST', apiResource(card.id) + '/stop');
-    }, '已请求停止：' + card.id, card).then(function () {
+      return request('POST', apiResource(card.id) + '/stop', undefined, ACTION_TIMEOUT_MS);
+    }, '已停止：' + card.id, card).then(function () {
       card.lock = false;
       syncButtons(card, currentMasterOn());
     });

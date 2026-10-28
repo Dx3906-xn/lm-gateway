@@ -36,6 +36,20 @@ import { log } from './log.js';
 /** Executions the gateway is running, in ComfyUI's `/history` shape. */
 const executions = new Map();
 
+/**
+ * Publish the execution table for the scheduler.
+ *
+ * The scheduler decides whether a resource may be released, and "an execution I accepted
+ * but have not finished" is precisely the fact it was missing: ComfyUI's own `/queue` and
+ * `/history` were both empty during a verified Qwen-Image run, so a probe built on those
+ * concluded "idle" while the model was sampling. This record cannot be wrong about a graph
+ * this process accepted.
+ *
+ * Set once at module load rather than passed through every call, because the scheduler
+ * imports comfyapi's collaborators and a direct import would be a cycle.
+ */
+globalThis.__lmGatewayExecutions = executions;
+
 /** Delete finished entries after a while; a long-lived gateway must not grow forever. */
 const RETENTION_MS = 60 * 60 * 1000;
 

@@ -179,6 +179,19 @@ Anima 用 `text`）。字段写错时 ComfyUI 会静默忽略，出图完全没�
 **代码生成图的资源要声明 `classes`**：Breeze 的图是每次请求现拼的，没有 JSON 可
 introspect，所以配置里显式列出它能跑的节点类，否则 `/prompt` 推断时找不到它。
 
+### 工作流文件（可直接拖进 ComfyUI）
+
+`config/workflows/` 里每套都有两种格式：
+
+| 文件 | 用途 |
+|---|---|
+| `*-ui.json` | **拖进 ComfyUI 或 File > Open**，带画布布局 |
+| `*-api.json` | 提交给 `POST /prompt`，无布局 |
+
+三套：`qwen21-image`（7 节点）、`anima-image`（9 节点）、`breeze-tts`（6 节点，含 design/clone/direction 三种模式节点）。
+
+重新生成：`python E:\B\scripts\export_all_workflows.py`
+
 ---
 
 ## 已知约束
@@ -191,6 +204,8 @@ introspect，所以配置里显式列出它能跑的节点类，否则 `/prompt`
 - **后端端口是运行时决定的**：日志第一行 `ports allocated:` 才是真值；
   文档里的 8188 只是默认起点，不是保证
 - **`/prompt` 靠 `class_type` 推断模型**：自造节点类的图会被 400 拒绝，这是设计
+- **ComfyUI 的 `/queue` 看不到"正在执行"**：生成期间它是空的，所以网关靠**自己记的未完成
+  执行**判断忙闲。这也是「生成到一半被停用」那个 bug 的根因
 
 完整约束清单见 [docs/DESIGN.md](docs/DESIGN.md) §11。
 
